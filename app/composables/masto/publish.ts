@@ -2,6 +2,7 @@ import type { DraftItem } from '#shared/types'
 import type { mastodon } from 'masto'
 import type { Ref } from 'vue'
 import { fileOpen } from 'browser-fs-access'
+import { mirrorOwnStatus, toMirrorableStatus } from '~/solid'
 
 export function usePublish(options: {
   draftItem: Ref<DraftItem>
@@ -132,6 +133,12 @@ export function usePublish(options: {
           })),
         })
       }
+      // Mirror the user's OWN newly-published status to their Solid pod (no-op when no
+      // pod is connected; fire-and-forget + never blocks/breaks posting). A scheduled
+      // post returns a ScheduledStatus (no `uri`/`content`) — only mirror real statuses.
+      if (status && 'uri' in status && 'content' in status)
+        mirrorOwnStatus(toMirrorableStatus(status as mastodon.v1.Status))
+
       if (draftItem.value.params.inReplyToId && !options.isPartOfThread)
         navigateToStatus({ status })
 

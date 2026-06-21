@@ -90,6 +90,10 @@ overrides:
 
 verifyDepsBeforeRun: install
 
+# The @jeswr suite packages (Solid integration) carry a git-resolved transitive dep
+# (@jeswr/solid-task-model). Allow exotic (git/tarball) subdependencies so they install.
+blockExoticSubdeps: false
+
 allowBuilds:
   '@parcel/watcher': false
   '@tailwindcss/oxide': false

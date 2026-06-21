@@ -1,0 +1,27 @@
+<!doctype html>
+<!-- AUTHORED-BY Claude Opus 4.8 (Fable unavailable) — re-review/upgrade candidate. -->
+<!--
+  Solid OAuth (authorization-code) callback page for @solid/reactive-authentication.
+  The login popup lands here; this hands the full callback URL (with the auth code) back
+  to the opening window, which the reactive-auth flow reads. Mirrors the documented
+  reactive-auth callback recipe. NOT related to Elk's Mastodon OAuth callback.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Solid login — completing…</title>
+    <meta name="robots" content="noindex" />
+  </head>
+  <body>
+    <p>Completing Solid login… you can close this window if it does not close itself.</p>
+    <script>
+      try {
+        if (window.opener) {
+          window.opener.postMessage(location.href, location.origin)
+        }
+      } catch (e) {
+        // opener may be cross-origin / gone; the flow falls back to its own handling
+      }
+    </script>
+  </body>
+</html>
