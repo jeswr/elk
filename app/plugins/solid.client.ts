@@ -132,15 +132,28 @@ export default defineNuxtPlugin(async () => {
    * private client state (settings/drafts/emojis) can never land in a container without an
    * owner-only ACL. Also starts watching the mirrored keys so ongoing edits push to the pod.
    */
-  async function mountPod(): Promise<void> {
+  async function mountPod(isCurrent?: () => boolean): Promise<void> {
     const base = solidPodBase.value
     if (!base)
       return
     const kvContainer = `${base}kv/`
     // Owner-only ACL FIRST — throws on failure (fail-closed; never mount on an unprotected container).
     await ensureKvAcl(kvContainer)
+    // SILENT-RESTORE RACE (roborev HIGH): `ensureKvAcl` awaits, so a login()/logout() can race ahead
+    // here. A now-stale restore must NOT install the pod storage singleton / start the mirror watcher
+    // for the OLD user — re-check the captured generation and abort silently if it changed, leaving
+    // the newer session's pod state intact. The interactive login() passes no guard (it is the
+    // latest action) so its mount is unchanged.
+    if (isCurrent && !isCurrent())
+      return
     const storage = createPodStorage(kvContainer, solidFetch.value)
     await setPodStorage(storage)
+    // `setPodStorage` awaits a hydrate; re-check ONE more time before starting the mirror watcher so
+    // a login()/logout() that raced during the hydrate does not leave a watcher running for a stale
+    // (old/logged-out) session. `podConnected()` additionally gates on solidWebId/solidPodBase (which
+    // a logout clears), so a briefly-installed storage singleton is inert; we simply do not watch.
+    if (isCurrent && !isCurrent())
+      return
     // Persist ongoing settings/drafts/emoji edits to the pod (not just the initial hydrate).
     watchMirroredKeys()
   }
@@ -186,23 +199,44 @@ export default defineNuxtPlugin(async () => {
     .then(async (restored) => {
       if (!restored)
         return // nothing to restore / failed → stay logged-out, NO popup
-      // GUARD: a login()/logout() raced ahead of this restore → DISCARD the stale restored
-      // result. Do NOT adopt its fetch, do NOT connect/mount — the interactive action wins.
+      // GUARD (pre-adoption): a login()/logout() raced ahead of this restore → DISCARD the stale
+      // restored result. Do NOT adopt its fetch, do NOT connect/mount — the interactive action wins.
       if (!isRestoreGenerationCurrent(restoreGen))
         return
-      // A silent restore succeeded AND no login/logout raced it. ADOPT the restored
-      // DPoP-AUTHENTICATED fetch as the pod fetch BEFORE establishing pod state / mounting
-      // storage, so every subsequent pod request carries the restored DPoP authorization with NO
-      // interactive popup (the cross-app invariant + the roborev HIGH). `connectSolid` +
-      // `mountPod` read `solidFetch.value` (resolveStorageRoot, createPodStorage, ensureKvAcl),
-      // so it MUST be the authed fetch by the time they run — not the bare/unauthenticated
-      // global fetch.
+      // A silent restore succeeded AND no login/logout has raced it (so far). ADOPT the restored
+      // DPoP-AUTHENTICATED fetch as the pod fetch BEFORE establishing pod state / mounting storage,
+      // so every subsequent pod request carries the restored DPoP authorization with NO interactive
+      // popup (the cross-app invariant + the roborev HIGH). `connectSolid` + `mountPod` read
+      // `solidFetch.value` (resolveStorageRoot, createPodStorage, ensureKvAcl), so it MUST be the
+      // authed fetch by the time they run — not the bare/unauthenticated global fetch.
       solidFetch.value = restored.fetch
-      await connectSolid(restored.webId)
-      await mountPod()
+
+      // GENERATION-GATE EVERY POST-AWAIT SHARED-STATE WRITE (roborev HIGH — the last race window).
+      // The pre-adoption check above is insufficient on its own: `connectSolid()` and `mountPod()`
+      // each `await` (and write shared state — solidWebId/solidPodBase/the persisted pointer, and the
+      // pod-storage singleton — AFTER their OWN internal awaits too), so a login()/logout() can fire
+      // anywhere in this window and still be clobbered by this stale restore (writing the OLD user's
+      // WebID/pod-base/pod storage). We therefore (a) pass the captured generation INTO connectSolid
+      // + mountPod so each of their post-internal-await writes is itself gated, AND (b) re-check
+      // between them here so a stale restore stops advancing the moment it loses the race. CRUCIALLY
+      // we do NOT disconnect on a stale restore — that would tear down the CURRENT (newer) session.
+      const isCurrent = () => isRestoreGenerationCurrent(restoreGen)
+      await connectSolid(restored.webId, isCurrent)
+      if (!isCurrent())
+        return // a login()/logout() raced during connectSolid() → leave the newer state intact
+      await mountPod(isCurrent)
     })
     .catch((err) => {
-      // Fail-closed: leave logged-out (no popup). Tear down any partial state.
+      // A FAILURE in the restore connect/mount flow. CRITICAL (roborev HIGH): only a CURRENT
+      // restore's genuine failure may clean up. If a login()/logout() raced ahead (the generation
+      // changed), this restore is STALE — its failure is irrelevant and `disconnectSolid()` would
+      // bump the generation + TEAR DOWN the NOW-CURRENT session (the newer login's fetch/WebID/pod).
+      // So on a stale restore we return SILENTLY, never touching the current session. Only when the
+      // restore is STILL CURRENT do we fail-closed and tear down our own partial state.
+      if (!isRestoreGenerationCurrent(restoreGen)) {
+        // Stale restore failed — the newer login/logout already owns the session; do NOT disconnect.
+        return
+      }
       console.warn('[solid] silent restore could not complete; staying logged-out:', err)
       disconnectSolid()
     })

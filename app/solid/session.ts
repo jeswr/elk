@@ -546,10 +546,22 @@ function clientIdDocumentUrl(): string {
  * Connect a Solid pod: record the WebID, resolve the pod base container, persist the
  * WebID for silent restore. The reactive-auth manager (registered by the plugin) makes
  * `globalThis.fetch` the authed fetch, so we do not store a token here.
+ *
+ * SILENT-RESTORE RACE (roborev HIGH — the last race window): `resolveStorageRoot` AWAITS a network
+ * fetch before the shared `solidWebId`/`solidPodBase` refs (and the persisted WebID / remembered
+ * pointer) are written. A silent restore passes the OPTIONAL `isCurrent` guard (its captured restore
+ * generation, re-evaluated AFTER the await) so that if an interactive `login()`/`logout()` raced
+ * ahead WHILE `resolveStorageRoot` was in flight, this (now-stale) restore performs NONE of those
+ * writes — it must not clobber the newer session's WebID/pod-base for the OLD user. The interactive
+ * `login()` path passes no guard (it is itself the latest action), so its behaviour is unchanged.
  */
-export async function connectSolid(webId: string): Promise<void> {
+export async function connectSolid(webId: string, isCurrent?: () => boolean): Promise<void> {
   const fetchImpl = solidFetch.value
   const root = await resolveStorageRoot(webId, fetchImpl)
+  // A stale silent restore (a login/logout raced during resolveStorageRoot) must NOT write any
+  // shared pod state — return without touching solidWebId/solidPodBase/persistence.
+  if (isCurrent && !isCurrent())
+    return
   solidWebId.value = webId
   solidPodBase.value = `${root}${ELK_POD_NAMESPACE}`
   try {
@@ -564,6 +576,10 @@ export async function connectSolid(webId: string): Promise<void> {
   // live connection — it just means the next load shows login instead of silently restoring.
   try {
     const issuer = await resolveOidcIssuer(webId, fetchImpl)
+    // After this further await, re-check once more: a stale restore must not (re)write the
+    // remembered-account pointer for the OLD user over a login/logout that raced ahead.
+    if (isCurrent && !isCurrent())
+      return
     const { RememberedAccount } = await import('@jeswr/solid-session-restore')
     new RememberedAccount(ELK_REMEMBERED_ACCOUNT_KEY).write(webId, issuer)
   }

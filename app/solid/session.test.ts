@@ -53,6 +53,7 @@ vi.mock('@jeswr/unstorage-solid', () => ({ default: (opts: any) => solidDriverMo
 const {
   silentRestore,
   authedFetchFromRestoredSession,
+  connectSolid,
   disconnectSolid,
   resetSolidFetchToDefault,
   setDefaultSolidFetch,
@@ -61,6 +62,8 @@ const {
   bumpRestoreGeneration,
   isRestoreGenerationCurrent,
   solidFetch,
+  solidWebId,
+  solidPodBase,
   ELK_REMEMBERED_ACCOUNT_KEY,
 } = await import('./session')
 const { createPodStorage } = await import('./storage')
@@ -674,6 +677,238 @@ describe('solidFetch reset — no cross-user DPoP-token reuse after logout / bef
     // The restored fetch IS adopted — proving the guard discards ONLY on a real race.
     expect(solidFetch.value).toBe(restoredFetch)
     expect(solidFetch.value).not.toBe(patchedGlobal)
+  })
+
+  // ---- roborev HIGH #3 (the LAST race window): the generation is checked BEFORE adopting the
+  // restored fetch, but `connectSolid()` and `mountPod()` `await` AFTER it. A login()/logout() that
+  // fires in that POST-ADOPTION window (after the line-191 check, during the connect/mount awaits)
+  // must still WIN: the stale restore must perform NO further shared-state mutation, and its FAILURE
+  // path must NOT call disconnectSolid() on the now-CURRENT session. We re-implement the plugin's
+  // full post-adoption flow over the SAME guard primitives, with controllable awaits so a race can
+  // be injected at the precise point connectSolid()/mountPod() would suspend. ----
+
+  // Faithfully mirrors the plugin's restore .then/.catch flow (the fixed version): adopt the fetch,
+  // re-check the generation after EACH await, abort silently when stale, and — in the catch — gate
+  // disconnectSolid() on the generation. `connect`/`mount` are injected so a test can make them
+  // throw (to drive the catch) and so `raceDuringConnect`/`raceDuringMount` fire WHILE they're
+  // suspended. `mutate*` record any shared-state write the flow performs so a test can assert a
+  // stale restore made NONE. Returns whether disconnect ran (the current-session-teardown signal).
+  async function runPluginPostAdoptionRace(opts: {
+    restoredFetch: typeof globalThis.fetch
+    connect: () => Promise<void>
+    mount?: () => Promise<void>
+    raceDuringConnect?: () => void
+    raceDuringMount?: () => void
+    mutateOnConnect?: () => void
+    mutateOnMount?: () => void
+  }): Promise<{ disconnectCalled: boolean }> {
+    const restoreGen = beginRestoreGeneration()
+    let disconnectCalled = false
+    // The plugin's logout()/its catch both ultimately call disconnectSolid(); here we wrap it so the
+    // test can observe whether the STALE restore wrongly tore down the current session.
+    const disconnect = () => {
+      disconnectCalled = true
+      disconnectSolid()
+    }
+    try {
+      const restored = { fetch: opts.restoredFetch }
+      // pre-adoption guard (already covered by the older tests; included so the flow is faithful)
+      if (!isRestoreGenerationCurrent(restoreGen))
+        return { disconnectCalled }
+      solidFetch.value = restored.fetch
+      // connectSolid(): suspends here — inject the race, then (in the real plugin) it writes
+      // solidWebId/solidPodBase. We only perform that write if STILL current.
+      opts.raceDuringConnect?.()
+      await opts.connect()
+      if (!isRestoreGenerationCurrent(restoreGen))
+        return { disconnectCalled } // stale during connect → leave newer state intact, NO mutation
+      opts.mutateOnConnect?.()
+      // mountPod(): suspends here — inject the race, then it would mount pod storage.
+      opts.raceDuringMount?.()
+      if (opts.mount)
+        await opts.mount()
+      if (!isRestoreGenerationCurrent(restoreGen))
+        return { disconnectCalled } // stale during mount → no trailing mutation
+      opts.mutateOnMount?.()
+      return { disconnectCalled }
+    }
+    catch {
+      // The fixed catch: ONLY a CURRENT restore's failure may clean up. A stale restore returns
+      // silently — disconnectSolid() here would tear down the now-current session (the HIGH).
+      if (!isRestoreGenerationCurrent(restoreGen))
+        return { disconnectCalled }
+      disconnect()
+      return { disconnectCalled }
+    }
+  }
+
+  it('a LOGIN firing AFTER fetch-adoption but DURING the connect/mount awaits → stale restore makes NO further state mutation', async () => {
+    const patchedGlobal = (async () => new Response('global', { status: 200 })) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+    resetSolidFetchToDefault()
+    const staleRestoredFetch = authedFetchFromRestoredSession(restoredSession('https://alice.example/#me'))
+
+    // What the interactive login() actually does (its first two steps) — fired mid-connect.
+    const loginFetch = (async () => new Response('login', { status: 200 })) as typeof globalThis.fetch
+    const login = () => {
+      bumpRestoreGeneration() // login() bumps the generation FIRST
+      setDefaultSolidFetch(loginFetch)
+      resetSolidFetchToDefault() // login() resets to default next → solidFetch.value = loginFetch
+    }
+
+    let podWriteHappened = false
+    const { disconnectCalled } = await runPluginPostAdoptionRace({
+      restoredFetch: staleRestoredFetch,
+      raceDuringConnect: login, // the login fires AFTER adoption, while connectSolid() is suspended
+      connect: async () => {}, // connectSolid() resolves
+      mount: async () => {},
+      mutateOnConnect: () => { podWriteHappened = true }, // would write solidWebId/solidPodBase
+      mutateOnMount: () => { podWriteHappened = true }, // would mount pod storage
+    })
+
+    // The stale restore performed NO further mutation after going stale — no pod write.
+    expect(podWriteHappened).toBe(false)
+    // The pod fetch reflects the LOGIN, not the stale restored DPoP fetch.
+    expect(solidFetch.value).toBe(loginFetch)
+    expect(solidFetch.value).not.toBe(staleRestoredFetch)
+    // The stale restore did NOT tear down the current session.
+    expect(disconnectCalled).toBe(false)
+  })
+
+  it('a LOGOUT firing in the post-adoption window → stale restore does NOT disconnect the current (logged-out) session and does NOT re-mount', async () => {
+    const patchedGlobal = (async () => new Response('global', { status: 200 })) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+    resetSolidFetchToDefault()
+    const staleRestoredFetch = authedFetchFromRestoredSession(restoredSession('https://alice.example/#me'))
+
+    let mounted = false
+    // The logout() == disconnectSolid() fires mid-connect (after adoption). It bumps the generation.
+    const { disconnectCalled } = await runPluginPostAdoptionRace({
+      restoredFetch: staleRestoredFetch,
+      raceDuringConnect: () => { disconnectSolid() }, // logout in the post-adoption window
+      connect: async () => {},
+      mount: async () => { mounted = true },
+      mutateOnMount: () => { mounted = true },
+    })
+
+    // The stale restore did NOT re-mount the pod for the logged-out user.
+    expect(mounted).toBe(false)
+    // The pod fetch is the default (logout reset it), NOT the stale restored DPoP fetch.
+    expect(solidFetch.value).toBe(patchedGlobal)
+    expect(solidFetch.value).not.toBe(staleRestoredFetch)
+    // CRITICAL: the stale restore did NOT call disconnectSolid() on the current (logged-out) session.
+    expect(disconnectCalled).toBe(false)
+  })
+
+  it('a stale restore whose connect/mount FAILS does NOT disconnect the now-current session (catch is generation-gated)', async () => {
+    const patchedGlobal = (async () => new Response('global', { status: 200 })) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+    resetSolidFetchToDefault()
+    const staleRestoredFetch = authedFetchFromRestoredSession(restoredSession('https://alice.example/#me'))
+
+    // A newer login fires mid-connect, THEN connectSolid() rejects (a genuine failure of the now-stale restore).
+    const loginFetch = (async () => new Response('login', { status: 200 })) as typeof globalThis.fetch
+    const { disconnectCalled } = await runPluginPostAdoptionRace({
+      restoredFetch: staleRestoredFetch,
+      raceDuringConnect: () => {
+        bumpRestoreGeneration()
+        setDefaultSolidFetch(loginFetch)
+        resetSolidFetchToDefault()
+      },
+      connect: async () => { throw new Error('connect failed after the race') },
+    })
+
+    // The stale restore's failure did NOT tear down the now-current login's session.
+    expect(disconnectCalled).toBe(false)
+    expect(solidFetch.value).toBe(loginFetch)
+  })
+
+  it('happy path (no race): the post-adoption flow fully connects AND mounts (guard not vacuous)', async () => {
+    const patchedGlobal = (async () => new Response('global', { status: 200 })) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+    resetSolidFetchToDefault()
+    const restoredFetch = authedFetchFromRestoredSession(restoredSession('https://alice.example/#me'))
+
+    let connected = false
+    let mounted = false
+    const { disconnectCalled } = await runPluginPostAdoptionRace({
+      restoredFetch,
+      connect: async () => {},
+      mount: async () => {},
+      mutateOnConnect: () => { connected = true },
+      mutateOnMount: () => { mounted = true },
+    })
+
+    // With NO race the full flow runs: fetch adopted, connect + mount both performed.
+    expect(solidFetch.value).toBe(restoredFetch)
+    expect(connected).toBe(true)
+    expect(mounted).toBe(true)
+    expect(disconnectCalled).toBe(false)
+  })
+
+  it('real connectSolid: a generation bump DURING resolveStorageRoot blocks the stale restore\'s solidWebId/solidPodBase writes', async () => {
+    // Drive the PRODUCTION connectSolid(webId, isCurrent). resolveStorageRoot awaits solidFetch.value
+    // before writing solidWebId/solidPodBase — the residual internal-await window. We suspend that
+    // fetch, bump the generation (a racing login/logout) mid-flight, then resolve: the stale restore
+    // must write NEITHER ref.
+    solidWebId.value = null
+    solidPodBase.value = null
+    const restoreGen = beginRestoreGeneration()
+
+    // A controllable fetch: the FIRST call (resolveStorageRoot) suspends until we release it; we bump
+    // the generation while it is suspended. A non-ok response makes resolveStorageRoot fall back to
+    // the origin-root default (no parseRdf) and makes resolveOidcIssuer throw (caught) — so the only
+    // writes that could happen are the generation-gated solidWebId/solidPodBase.
+    let releaseFetch!: () => void
+    const gate = new Promise<void>(r => (releaseFetch = r))
+    let first = true
+    solidFetch.value = (async () => {
+      if (first) {
+        first = false
+        await gate
+      }
+      return new Response('nope', { status: 404 })
+    }) as typeof globalThis.fetch
+
+    const connecting = connectSolid('https://alice.pod.example/profile/card#me', () => isRestoreGenerationCurrent(restoreGen))
+    // A racing login()/logout() bumps the generation WHILE resolveStorageRoot is suspended.
+    bumpRestoreGeneration()
+    releaseFetch()
+    await connecting
+
+    // The stale restore's connectSolid wrote NEITHER shared ref — the newer session is untouched.
+    expect(solidWebId.value).toBeNull()
+    expect(solidPodBase.value).toBeNull()
+  })
+
+  it('real connectSolid: with NO race (still current), the writes DO happen (guard not vacuous)', async () => {
+    solidWebId.value = null
+    solidPodBase.value = null
+    const restoreGen = beginRestoreGeneration()
+    // A simple non-ok fetch → origin-root fallback for storage; issuer resolution throws (caught).
+    solidFetch.value = (async () => new Response('nope', { status: 404 })) as typeof globalThis.fetch
+
+    await connectSolid('https://alice.pod.example/profile/card#me', () => isRestoreGenerationCurrent(restoreGen))
+
+    // No race → the refs ARE written (origin-root + Elk namespace).
+    expect(solidWebId.value).toBe('https://alice.pod.example/profile/card#me')
+    expect(solidPodBase.value).toBe('https://alice.pod.example/elk/')
+  })
+
+  it('a stale restore whose connect/mount FAILS while STILL CURRENT does fail-closed + disconnect (catch not vacuous)', async () => {
+    const patchedGlobal = (async () => new Response('global', { status: 200 })) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+    resetSolidFetchToDefault()
+    const restoredFetch = authedFetchFromRestoredSession(restoredSession('https://alice.example/#me'))
+
+    // NO race — the restore stays current — but connectSolid() genuinely fails. The catch SHOULD
+    // clean up (this proves the generation gate in the catch is not always-skip).
+    const { disconnectCalled } = await runPluginPostAdoptionRace({
+      restoredFetch,
+      connect: async () => { throw new Error('genuine connect failure, no race') },
+    })
+
+    expect(disconnectCalled).toBe(true)
   })
 
   it('the restored fetch CAN re-mint via refresh, re-invoking restoreSession for the SAME issuer', async () => {
