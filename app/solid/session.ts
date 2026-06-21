@@ -70,6 +70,21 @@ export function setDefaultSolidFetch(fetchImpl: typeof globalThis.fetch): void {
 }
 
 /**
+ * The CURRENT default pod fetch (the reactive-auth patched global), via a stable getter. A SILENT
+ * TOKEN REFRESH (re-running the refresh-grant restore at the token endpoint) MUST go through THIS,
+ * never `solidFetch.value`: after a successful restore `solidFetch.value` IS the restored
+ * per-resource DPoP fetch (an EXPIRED-token fetch when a refresh is needed), so routing the
+ * refresh's token-endpoint request through it would send the token request under the
+ * expired/wrong DPoP authorization (recursion / wrong auth headers — the roborev HIGH). The
+ * patched global upgrades a 401 for the currently interactive identity and carries no single
+ * user's restored token, so it is the correct transport for the discovery + grant. Returned as a
+ * getter (re-evaluated per call) so the refresh rides whatever the patched global currently is.
+ */
+export function getDefaultSolidFetch(): typeof globalThis.fetch {
+  return defaultSolidFetch
+}
+
+/**
  * RESET the pod fetch to the default (patched global) fetch, DROPPING any restored per-session
  * DPoP fetch. MUST run on logout AND before any interactive login / account switch so a restored
  * user's DPoP token can never be reused for a DIFFERENT user's profile resolution, ACL writes,
@@ -79,6 +94,50 @@ export function setDefaultSolidFetch(fetchImpl: typeof globalThis.fetch): void {
  */
 export function resetSolidFetchToDefault(): void {
   solidFetch.value = defaultSolidFetch
+}
+
+/**
+ * The RESTORE GENERATION counter (roborev HIGH — restore-in-flight cross-user race). A silent
+ * restore is ASYNCHRONOUS: between calling `silentRestore()` and its resolution the user may
+ * interactively `login()` or `logout()`. Without a guard the late-resolving restore would
+ * unconditionally adopt the OLD restored user's DPoP fetch, clobbering the interactive
+ * login/logout that happened meanwhile (one user's token leaking onto another's session).
+ *
+ * The protocol: a restore captures the current generation via {@link beginRestoreGeneration}
+ * (which bumps it so any restore ALREADY in flight is invalidated too); `login()`, `logout()`,
+ * and `disconnectSolid()` each call {@link bumpRestoreGeneration} to invalidate any in-flight
+ * restore; when a restore resolves the caller adopts its result ONLY if
+ * {@link isRestoreGenerationCurrent} still holds for its captured generation — otherwise the
+ * stale restore is DISCARDED (no fetch adopted, no pod mounted).
+ */
+let restoreGeneration = 0
+
+/**
+ * Bump the restore generation, invalidating any silent restore currently in flight. Call from
+ * the interactive `login()` and from `logout()`/`disconnectSolid()` so a restore that resolves
+ * AFTER an explicit login/logout is discarded rather than clobbering it.
+ */
+export function bumpRestoreGeneration(): void {
+  restoreGeneration++
+}
+
+/**
+ * Begin a restore: bump the generation (so an EARLIER in-flight restore is also invalidated) and
+ * return the new generation for the caller to capture. The caller passes this token to
+ * {@link isRestoreGenerationCurrent} when the restore resolves to decide whether to adopt it.
+ */
+export function beginRestoreGeneration(): number {
+  bumpRestoreGeneration()
+  return restoreGeneration
+}
+
+/**
+ * Whether the captured restore generation is still the current one — i.e. no `login()`,
+ * `logout()`, `disconnectSolid()`, or newer restore happened since the restore began. When this
+ * is false the restore result is STALE and MUST be discarded (do not adopt its fetch / mount).
+ */
+export function isRestoreGenerationCurrent(gen: number): boolean {
+  return gen === restoreGeneration
 }
 
 /**
@@ -337,9 +396,16 @@ export function authedFetchFromRestoredSession(
         // A second 401 after a fresh token → do NOT loop; let the caller see the failure.
         return res.status === 401 ? null : res
       }
-      catch {
-        // The retry itself failed (network / still-401 challenge) — no further attempts.
-        return null
+      catch (retryErr) {
+        // Only SUPPRESS a SECOND auth failure (another 401 / token-expiry challenge): return null
+        // so the ORIGINAL 401 propagates and we do NOT loop. RETHROW any UNRELATED retry error
+        // (network, 5xx, parse, DPoP-nonce) so a real failure surfaces as itself rather than
+        // being masked as the original 401 (the roborev Medium). `attempt()` folds in its own
+        // single DPoP-nonce retry, so a nonce error here is genuinely terminal — but it is not a
+        // token-expiry, so it must rethrow, not be silently swallowed.
+        if (isTokenExpiry(retryErr) && !oauth.isDPoPNonceError(retryErr))
+          return null
+        throw retryErr
       }
     }
   }
@@ -403,14 +469,22 @@ export async function silentRestore(): Promise<SilentRestoreResult | null> {
     // restore (token-endpoint fetch, NO popup/iframe) to re-mint a fresh access token + handle
     // from the persisted refresh credential when the captured token expires. Scoped to the SAME
     // issuer/store/clientId the initial restore used. Returns null on any failure so the authed
-    // fetch fails closed rather than looping. NOTE we re-resolve `solidFetch.value` per call so
-    // the refresh discovery+grant ride the current patched fetch.
+    // fetch fails closed rather than looping.
+    //
+    // SECURITY/CORRECTNESS (roborev HIGH): the refresh's token-endpoint request MUST ride the
+    // DEFAULT (patched-global) fetch via `getDefaultSolidFetch()`, NEVER `solidFetch.value`. Once
+    // a restore succeeds the plugin adopts the restored per-resource DPoP fetch as
+    // `solidFetch.value`; that fetch is bound to the (now EXPIRED) access token a refresh exists
+    // to replace, so routing the refresh through it would re-send the token request under the
+    // expired/wrong DPoP authorization. The patched global is shared, user-agnostic, and carries
+    // no restored token — the correct transport for discovery + the refresh grant. We re-resolve
+    // it per call so the refresh always rides the CURRENT patched global.
     const refreshCredential: RefreshRestoredCredential = async () => {
       const fresh = await restoreSession({
         store,
         issuer: new URL(remembered.issuer ?? restoredSession?.issuer ?? ''),
         clientId,
-        fetch: solidFetch.value,
+        fetch: getDefaultSolidFetch(),
       })
       return fresh ? { accessToken: fresh.accessToken, dpopHandle: fresh.dpopHandle } : null
     }
@@ -502,6 +576,10 @@ export async function connectSolid(webId: string): Promise<void> {
 export function disconnectSolid(): void {
   solidWebId.value = null
   solidPodBase.value = null
+  // Invalidate any silent restore in flight (roborev HIGH — restore-in-flight race): a restore
+  // that resolves AFTER this logout must be DISCARDED, never adopt the logged-out user's restored
+  // DPoP fetch / re-mount their pod.
+  bumpRestoreGeneration()
   // SECURITY: drop any restored per-session DPoP fetch so a later login / account switch cannot
   // reuse the logged-out user's token (cross-user token reuse). After disconnect the pod fetch is
   // the default (patched global) again.

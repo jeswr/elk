@@ -56,6 +56,10 @@ const {
   disconnectSolid,
   resetSolidFetchToDefault,
   setDefaultSolidFetch,
+  getDefaultSolidFetch,
+  beginRestoreGeneration,
+  bumpRestoreGeneration,
+  isRestoreGenerationCurrent,
   solidFetch,
   ELK_REMEMBERED_ACCOUNT_KEY,
 } = await import('./session')
@@ -352,6 +356,56 @@ describe('authedFetchFromRestoredSession — DPoP-bound requests via oauth4webap
     expect(protectedResourceRequestMock).toHaveBeenCalledTimes(2)
   })
 
+  // ---- roborev Medium: refreshAndRetry must only SUPPRESS a SECOND auth failure; an UNRELATED
+  // retry error (network / 5xx / parse) must PROPAGATE as itself, not be masked as the 401. ----
+
+  it('a NETWORK error on the post-refresh retry PROPAGATES as that error, not masked as the 401', async () => {
+    // First request 401s (expired) → refresh mints a fresh token → the RETRY hits a network error.
+    // That non-auth error must surface as itself (not swallowed into the original 401).
+    const netErr = new Error('ECONNRESET on retry')
+    protectedResourceRequestMock
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 })) // initial 401
+      .mockRejectedValueOnce(netErr) // post-refresh retry: network failure (no .status)
+    const refresh = vi.fn(async () => ({ accessToken: 'fresh-token-999', dpopHandle: SENTINEL_HANDLE }))
+    const f = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'), refresh)
+
+    await expect(f('https://a.example/elk/kv/x')).rejects.toThrow('ECONNRESET on retry')
+    expect(refresh).toHaveBeenCalledTimes(1)
+    // The original request + the (failing) post-refresh retry.
+    expect(protectedResourceRequestMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('a 5xx-style non-auth THROW on the post-refresh retry PROPAGATES (not masked as the 401)', async () => {
+    // A thrown error carrying a non-401 status (e.g. a 503) is NOT a token-expiry → must rethrow.
+    const serverErr = Object.assign(new Error('Service Unavailable'), { status: 503 })
+    protectedResourceRequestMock
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+      .mockRejectedValueOnce(serverErr)
+    const refresh = vi.fn(async () => ({ accessToken: 'fresh-token-999', dpopHandle: SENTINEL_HANDLE }))
+    const f = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'), refresh)
+
+    await expect(f('https://a.example/elk/kv/x')).rejects.toThrow('Service Unavailable')
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(protectedResourceRequestMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('a SECOND 401 (THROWN invalid_token) on the post-refresh retry is suppressed → original 401 returned', async () => {
+    // First request 401s → refresh → the RETRY throws an invalid_token challenge (.status=401):
+    // a SECOND auth failure → suppress (return null) so the ORIGINAL 401 propagates, NO loop, NO throw.
+    protectedResourceRequestMock
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 })) // initial bare-401
+      .mockRejectedValueOnce(Object.assign(new Error('invalid_token'), { status: 401 })) // retry: 2nd auth failure
+    const refresh = vi.fn(async () => ({ accessToken: 'fresh-but-also-bad', dpopHandle: SENTINEL_HANDLE }))
+    const f = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'), refresh)
+
+    const res = await f('https://a.example/elk/kv/x')
+
+    // The original bare-401 is returned (degrade gracefully) — not thrown, not looped.
+    expect(res.status).toBe(401)
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(protectedResourceRequestMock).toHaveBeenCalledTimes(2)
+  })
+
   it('does NOT loop when refresh THROWS: returns the original 401, no retry', async () => {
     protectedResourceRequestMock.mockResolvedValue(new Response('unauthorized', { status: 401 }))
     const refresh = vi.fn(async () => {
@@ -497,6 +551,129 @@ describe('solidFetch reset — no cross-user DPoP-token reuse after logout / bef
     protectedResourceRequestMock.mockClear()
     await solidFetch.value('https://bob.pod.example/profile/card#me')
     expect(protectedResourceRequestMock).not.toHaveBeenCalled()
+  })
+
+  // ---- roborev HIGH #1: a token refresh must route through the DEFAULT (patched-global) fetch,
+  // NEVER the restored per-resource DPoP fetch (which is the EXPIRED-token fetch a refresh exists
+  // to replace — routing the refresh through it sends the token request under the wrong/expired
+  // DPoP authorization). ----
+  it('the refresh\'s restoreSession uses the DEFAULT fetch, NOT the restored per-resource fetch', async () => {
+    // A distinctly-identifiable default (patched-global) fetch + a distinct restored fetch.
+    const patchedGlobal = (async () => new Response('global', { status: 200 })) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+
+    const webId = 'https://dave.pod.example/profile/card#me'
+    rememberedRead.mockReturnValue({ webId, issuer: 'https://issuer.example/' })
+    restoreSessionMock
+      .mockResolvedValueOnce({ webId, accessToken: 'token1', dpopHandle: SENTINEL_HANDLE, issuer: 'https://issuer.example/' }) // initial restore
+      .mockResolvedValueOnce({ webId, accessToken: 'token2', dpopHandle: SENTINEL_HANDLE, issuer: 'https://issuer.example/' }) // refresh
+    decisionImpl = async (inputs) => {
+      const r = await inputs.restoreIssuer('https://issuer.example/')
+      return { outcome: 'restored', webId: r.webId, issuer: 'https://issuer.example/' }
+    }
+
+    const restored = await silentRestore()
+    expect(restored).not.toBeNull()
+
+    // The plugin ADOPTS the restored per-resource fetch as solidFetch.value (the real flow). After
+    // this, solidFetch.value IS the restored DPoP fetch — distinct from the default/patched global.
+    solidFetch.value = restored!.fetch
+    expect(solidFetch.value).not.toBe(getDefaultSolidFetch())
+
+    // First pod request 401s (token1 expired) → triggers the silent refresh → token2 → retry ok.
+    protectedResourceRequestMock
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+      .mockResolvedValueOnce(new Response('ok', { status: 200 }))
+    const res = await restored!.fetch('https://dave.pod.example/elk/kv/x')
+    expect(res.status).toBe(200)
+
+    // The refresh re-invoked restoreSession exactly once more (call index 1 = the refresh).
+    expect(restoreSessionMock).toHaveBeenCalledTimes(2)
+    const refreshCall = restoreSessionMock.mock.calls[1][0] as { fetch?: unknown }
+    // CRITICAL: the refresh's token-endpoint request used the DEFAULT fetch — IDENTITY-equal to
+    // the patched global — NOT the restored per-resource DPoP fetch (the expired-token fetch).
+    expect(refreshCall.fetch).toBe(patchedGlobal)
+    expect(refreshCall.fetch).not.toBe(restored!.fetch)
+    expect(refreshCall.fetch).not.toBe(solidFetch.value)
+  })
+
+  // ---- roborev HIGH #2: restore-in-flight race. A login()/logout() that happens WHILE a silent
+  // restore is in flight must WIN — the late-resolving restore is DISCARDED, never adopting the
+  // stale restored user's DPoP fetch. We exercise the SAME generation-guard contract the plugin
+  // uses (beginRestoreGeneration before the async restore; isRestoreGenerationCurrent after it;
+  // login bumps via bumpRestoreGeneration, logout via disconnectSolid). ----
+
+  // Re-implements the plugin's restore-adopt flow over the session-module guard primitives, so the
+  // race can be unit-tested without the full Nuxt plugin harness. `race` runs WHILE restore is in
+  // flight (between begin and resolve) to simulate an interactive login()/logout() interleaving.
+  async function runPluginRestoreWithRace(
+    restoredFetch: typeof globalThis.fetch,
+    race: () => void,
+  ): Promise<void> {
+    const restoreGen = beginRestoreGeneration() // plugin captures the generation BEFORE the restore
+    // The async restore: a deferred whose resolution we control so `race()` runs mid-flight.
+    let resolveRestore!: (v: { fetch: typeof globalThis.fetch }) => void
+    const restorePromise = new Promise<{ fetch: typeof globalThis.fetch }>(r => (resolveRestore = r))
+    const adopted = restorePromise.then((restored) => {
+      // The plugin's guard: only adopt the restored fetch if no login/logout raced ahead.
+      if (!isRestoreGenerationCurrent(restoreGen))
+        return
+      solidFetch.value = restored.fetch
+    })
+    // An interactive login() / logout() fires WHILE the restore is still pending.
+    race()
+    // Now the restore finally resolves — its .then runs the guard.
+    resolveRestore({ fetch: restoredFetch })
+    await adopted
+  }
+
+  it('a LOGIN that races an in-flight restore DISCARDS the late restore (login wins)', async () => {
+    const patchedGlobal = (async () => new Response('global', { status: 200 })) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+    // Start from the default fetch (as after the plugin records the patched global).
+    resetSolidFetchToDefault()
+    const staleRestoredFetch = authedFetchFromRestoredSession(restoredSession('https://alice.example/#me'))
+
+    // login() bumps the generation (and resets the fetch to default — its real behaviour).
+    await runPluginRestoreWithRace(staleRestoredFetch, () => {
+      bumpRestoreGeneration() // what login() does first
+      resetSolidFetchToDefault() // what login() does next
+    })
+
+    // The stale restored fetch was NOT adopted — the pod fetch reflects the login (default), not
+    // Alice's restored DPoP fetch.
+    expect(solidFetch.value).toBe(patchedGlobal)
+    expect(solidFetch.value).not.toBe(staleRestoredFetch)
+  })
+
+  it('a LOGOUT (disconnectSolid) that races an in-flight restore DISCARDS the late restore', async () => {
+    const patchedGlobal = (async () => new Response('global', { status: 200 })) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+    resetSolidFetchToDefault()
+    const staleRestoredFetch = authedFetchFromRestoredSession(restoredSession('https://alice.example/#me'))
+
+    // logout() == disconnectSolid(): it bumps the generation AND resets the fetch to default.
+    await runPluginRestoreWithRace(staleRestoredFetch, () => {
+      disconnectSolid()
+    })
+
+    // The stale restored fetch was NOT adopted — the pod fetch reflects the logout (default).
+    expect(solidFetch.value).toBe(patchedGlobal)
+    expect(solidFetch.value).not.toBe(staleRestoredFetch)
+  })
+
+  it('with NO racing login/logout, an in-flight restore IS adopted (guard is not vacuous)', async () => {
+    const patchedGlobal = (async () => new Response('global', { status: 200 })) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+    resetSolidFetchToDefault()
+    const restoredFetch = authedFetchFromRestoredSession(restoredSession('https://alice.example/#me'))
+
+    // No race: nothing bumps the generation between begin and resolve.
+    await runPluginRestoreWithRace(restoredFetch, () => {})
+
+    // The restored fetch IS adopted — proving the guard discards ONLY on a real race.
+    expect(solidFetch.value).toBe(restoredFetch)
+    expect(solidFetch.value).not.toBe(patchedGlobal)
   })
 
   it('the restored fetch CAN re-mint via refresh, re-invoking restoreSession for the SAME issuer', async () => {

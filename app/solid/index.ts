@@ -21,11 +21,15 @@ export {
 export type { MirrorableStatus, MirrorResult } from './mirror'
 export { mirrorStatus, statusToCanonical } from './mirror'
 export {
+  beginRestoreGeneration,
+  bumpRestoreGeneration,
   connectSolid,
   disconnectSolid,
   ELK_POD_NAMESPACE,
   ELK_REMEMBERED_ACCOUNT_KEY,
   ELK_SESSION_DB_NAME,
+  getDefaultSolidFetch,
+  isRestoreGenerationCurrent,
   persistedSolidWebId,
   resetSolidFetchToDefault,
   resolveOidcIssuer,

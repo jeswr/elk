@@ -22,11 +22,14 @@
  */
 
 import {
+  beginRestoreGeneration,
+  bumpRestoreGeneration,
   clearPodStorage,
   connectSolid,
   createPodStorage,
   disconnectSolid,
   ensureKvAcl,
+  isRestoreGenerationCurrent,
   resetSolidFetchToDefault,
   resolveOidcIssuer,
   setDefaultSolidFetch,
@@ -144,6 +147,10 @@ export default defineNuxtPlugin(async () => {
 
   /** Connect a pod by WebID (interactive login path): establish state, then mount the pod. */
   async function login(webId: string): Promise<void> {
+    // Invalidate any silent restore in flight (roborev HIGH — restore-in-flight race): a restore
+    // that resolves AFTER this interactive login must be DISCARDED, never clobber THIS login's
+    // fetch / pod with a stale restored user's DPoP fetch.
+    bumpRestoreGeneration()
     // Drop any restored per-session fetch BEFORE this (possibly different) user's profile is
     // resolved / pod is mounted — an interactive login / account switch must NOT carry the prior
     // restored user's DPoP token. The interactive identity uses the reactive-auth patched global
@@ -169,16 +176,27 @@ export default defineNuxtPlugin(async () => {
   // returns the restored WebID + the DPoP-authenticated fetch on success, else null
   // (logged-out, no popup).
   solidRestoring.value = true
+  // Capture the restore generation BEFORE the (async) restore begins. If an interactive login()
+  // or a logout()/disconnectSolid() happens WHILE the restore is in flight, it bumps the
+  // generation — and the late-resolving restore below is then STALE and MUST be discarded, so a
+  // prior restored user's DPoP fetch can never clobber the interactive login/logout (roborev
+  // HIGH — restore-in-flight cross-user race).
+  const restoreGen = beginRestoreGeneration()
   silentRestore()
     .then(async (restored) => {
       if (!restored)
         return // nothing to restore / failed → stay logged-out, NO popup
-      // A silent restore succeeded. ADOPT the restored DPoP-AUTHENTICATED fetch as the pod
-      // fetch BEFORE establishing pod state / mounting storage, so every subsequent pod
-      // request carries the restored DPoP authorization with NO interactive popup (the
-      // cross-app invariant + the roborev HIGH). `connectSolid` + `mountPod` read
-      // `solidFetch.value` (resolveStorageRoot, createPodStorage, ensureKvAcl), so it MUST be
-      // the authed fetch by the time they run — not the bare/unauthenticated global fetch.
+      // GUARD: a login()/logout() raced ahead of this restore → DISCARD the stale restored
+      // result. Do NOT adopt its fetch, do NOT connect/mount — the interactive action wins.
+      if (!isRestoreGenerationCurrent(restoreGen))
+        return
+      // A silent restore succeeded AND no login/logout raced it. ADOPT the restored
+      // DPoP-AUTHENTICATED fetch as the pod fetch BEFORE establishing pod state / mounting
+      // storage, so every subsequent pod request carries the restored DPoP authorization with NO
+      // interactive popup (the cross-app invariant + the roborev HIGH). `connectSolid` +
+      // `mountPod` read `solidFetch.value` (resolveStorageRoot, createPodStorage, ensureKvAcl),
+      // so it MUST be the authed fetch by the time they run — not the bare/unauthenticated
+      // global fetch.
       solidFetch.value = restored.fetch
       await connectSolid(restored.webId)
       await mountPod()
