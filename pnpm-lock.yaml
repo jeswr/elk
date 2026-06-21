@@ -231,6 +231,9 @@ importers:
       nuxt-security:
         specifier: ^2.4.0
         version: 2.4.0(magicast@0.5.3)(rollup@4.62.0)
+      oauth4webapi:
+        specifier: ^3.8.6
+        version: 3.8.6
       pathe:
         specifier: ^2.0.3
         version: 2.0.3

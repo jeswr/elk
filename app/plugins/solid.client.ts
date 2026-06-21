@@ -152,14 +152,21 @@ export default defineNuxtPlugin(async () => {
   // (no popup, no redirect, no iframe). On ANY restore failure we leave the user logged-out
   // and DEFER interactive login to an explicit user action — we never auto-open the popup
   // (calling the interactive `login()` here is exactly the bug this fixes). `silentRestore`
-  // returns the restored WebID on success, else null (logged-out, no popup).
+  // returns the restored WebID + the DPoP-authenticated fetch on success, else null
+  // (logged-out, no popup).
   solidRestoring.value = true
   silentRestore()
-    .then(async (restoredWebId) => {
-      if (!restoredWebId)
+    .then(async (restored) => {
+      if (!restored)
         return // nothing to restore / failed → stay logged-out, NO popup
-      // A silent restore succeeded: establish pod state for the restored WebID + mount.
-      await connectSolid(restoredWebId)
+      // A silent restore succeeded. ADOPT the restored DPoP-AUTHENTICATED fetch as the pod
+      // fetch BEFORE establishing pod state / mounting storage, so every subsequent pod
+      // request carries the restored DPoP authorization with NO interactive popup (the
+      // cross-app invariant + the roborev HIGH). `connectSolid` + `mountPod` read
+      // `solidFetch.value` (resolveStorageRoot, createPodStorage, ensureKvAcl), so it MUST be
+      // the authed fetch by the time they run — not the bare/unauthenticated global fetch.
+      solidFetch.value = restored.fetch
+      await connectSolid(restored.webId)
       await mountPod()
     })
     .catch((err) => {

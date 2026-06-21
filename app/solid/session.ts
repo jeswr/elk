@@ -24,6 +24,7 @@
  * import it solely from a `.client.ts` plugin.
  */
 
+import type { RestoredSession } from '@jeswr/solid-session-restore'
 import { computed, ref, shallowRef } from 'vue'
 
 /** The current Solid WebID, or `null` when no pod is connected. */
@@ -142,6 +143,86 @@ export async function resolveOidcIssuer(
 }
 
 /**
+ * The result of a SUCCESSFUL silent restore: the authenticated WebID PLUS the DPoP-bound,
+ * AUTHENTICATED `fetch` rebuilt from the restored session. The caller MUST adopt this fetch
+ * as the pod fetch (`solidFetch.value`) BEFORE mounting pod storage — otherwise the first
+ * protected pod request would go out on the bare, UNAUTHENTICATED global fetch (the roborev
+ * HIGH this fixes), falling into reactive-auth's interactive popup or failing outright.
+ */
+export interface SilentRestoreResult {
+  /** The WebID the restored session authenticated AS. */
+  readonly webId: string
+  /**
+   * The DPoP-authenticated `fetch` for this session — every request carries
+   * `Authorization: DPoP <accessToken>` + a fresh per-request DPoP proof signed by the
+   * session's bound (non-extractable) key. This is the "restored authed fetch" the
+   * cross-app invariant requires reach pod storage with NO popup.
+   */
+  readonly fetch: typeof globalThis.fetch
+}
+
+/**
+ * Build a DPoP-AUTHENTICATED `fetch` from a restored session. The auth-attaching mechanism
+ * is `oauth4webapi`'s `protectedResourceRequest` driven by the session's live `dpopHandle`
+ * (created INSIDE `@jeswr/solid-session-restore` from the persisted, non-extractable key) and
+ * its freshly-minted `accessToken`. We DELEGATE the DPoP proof signing + the
+ * `Authorization: DPoP …` header + the server-nonce handshake to oauth4webapi (the same
+ * vetted library that minted the handle) — NEVER hand-rolling a proof.
+ *
+ * Resource servers may answer the first DPoP request with a `use_dpop_nonce` challenge; the
+ * handle captures the server nonce from that error, so we retry ONCE with the nonce now
+ * primed (RFC 9449 §8). Any other failure propagates to the caller as a normal fetch error.
+ *
+ * The returned function matches the Fetch API surface the unstorage-solid driver / mirror
+ * call (`fetch(input, init)`), adapting it to `protectedResourceRequest`'s
+ * `(accessToken, method, url, headers, body, opts)` shape.
+ */
+export function authedFetchFromRestoredSession(
+  session: Pick<RestoredSession, 'accessToken' | 'dpopHandle'>,
+): typeof globalThis.fetch {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    // Normalise the Fetch API call into method + URL + headers + body. A `Request` object
+    // carries its own method/headers, overridden by an explicit `init`.
+    const req = input instanceof Request ? input : new Request(input, init)
+    const method = init?.method ?? req.method
+    const url = new URL(req.url)
+    const headers = new Headers(init?.headers ?? req.headers)
+    // protectedResourceRequest sets Authorization + DPoP itself; drop any stale ones.
+    headers.delete('authorization')
+    headers.delete('dpop')
+    // Read the body once (GET/HEAD have none). Use the init body verbatim when given so we
+    // do not consume a Request stream twice.
+    let body: ArrayBuffer | undefined
+    if (method !== 'GET' && method !== 'HEAD') {
+      const ab = init && 'body' in init
+        ? await new Request('http://x/', { method: 'POST', body: init.body }).arrayBuffer()
+        : await req.clone().arrayBuffer()
+      body = ab.byteLength > 0 ? ab : undefined
+    }
+
+    const oauth = await import('oauth4webapi')
+    const send = (): Promise<Response> =>
+      oauth.protectedResourceRequest(
+        session.accessToken,
+        method,
+        url,
+        headers,
+        body,
+        { DPoP: session.dpopHandle, signal: init?.signal ?? req.signal ?? undefined },
+      )
+    try {
+      return await send()
+    }
+    catch (err) {
+      // One retry once the handle has captured the server's DPoP nonce (RFC 9449 §8).
+      if (oauth.isDPoPNonceError(err))
+        return await send()
+      throw err
+    }
+  }
+}
+
+/**
  * Attempt a SILENT Solid session restore on load — refresh-grant only, NEVER a popup or
  * redirect (cross-app UX invariant #1). Reads the credential-free remembered-account
  * pointer (`@jeswr/solid-session-restore`) to find the last-active WebID + its issuer, then
@@ -149,22 +230,25 @@ export async function resolveOidcIssuer(
  * `fetch`, no window/iframe). The restore decision (`decideSilentRestore`) re-checks the
  * restored WebID equals the remembered one (WebID-scoped isolation, fail-closed).
  *
- * Returns the restored WebID on success (the caller then establishes pod state), or `null`
- * when there is nothing to restore / the credential is dead / the restore failed. CRUCIALLY
- * it NEVER opens an interactive login — on failure the user is simply left logged-out and an
- * interactive login is deferred to an explicit user action (a login button). Doomed/stale
- * pointers are dropped per the package's keep/drop matrix so they are not retried forever.
+ * Returns, on success, the restored WebID AND the DPoP-AUTHENTICATED `fetch` rebuilt from the
+ * restored session ({@link SilentRestoreResult}) — the caller adopts that fetch as the pod
+ * fetch BEFORE mounting pod storage so every pod request carries the restored DPoP
+ * authorization with NO popup (the roborev HIGH). Returns `null` when there is nothing to
+ * restore / the credential is dead / the restore failed. CRUCIALLY it NEVER opens an
+ * interactive login — on failure the user is simply left logged-out and an interactive login
+ * is deferred to an explicit user action (a login button). Doomed/stale pointers are dropped
+ * per the package's keep/drop matrix so they are not retried forever.
  *
  * NOTE: a silent restore only succeeds when a DPoP-bound refresh-token credential was
  * persisted at login time (IndexedDB, `extractable:false` key). Until the login path
  * persists one, this resolves to `null` (→ logged-out, no popup) — which is exactly the
  * fail-closed, no-popup-on-restore behaviour the invariant requires.
  */
-export async function silentRestore(): Promise<string | null> {
+export async function silentRestore(): Promise<SilentRestoreResult | null> {
   // Browser-only: IndexedDB + localStorage are required; bail (no popup) otherwise.
   if (typeof window === 'undefined')
     return null
-  let restoredWebId: string | null = null
+  let result: SilentRestoreResult | null = null
   try {
     const {
       IndexedDbSessionStore,
@@ -187,8 +271,13 @@ export async function silentRestore(): Promise<string | null> {
     const store = new IndexedDbSessionStore({ dbName: ELK_SESSION_DB_NAME })
     const clientId = clientIdDocumentUrl()
 
+    // Capture the FULL restored session (not just its WebID) so the success branch can build
+    // the DPoP-authenticated fetch from it. `decideSilentRestore`'s restoreIssuer contract is
+    // `{ webId } | undefined`, so the session itself is hoisted out via this closure var.
+    let restoredSession: RestoredSession | undefined
+
     // The single refresh-grant restore the decision drives — a token-endpoint fetch ONLY,
-    // never a popup/iframe. On success it records the restored WebID for the caller.
+    // never a popup/iframe. On success it records the restored session for the caller.
     const decision = await decideSilentRestore({
       lastActiveWebId: remembered.webId,
       remembered: [remembered],
@@ -199,21 +288,29 @@ export async function silentRestore(): Promise<string | null> {
           clientId,
           fetch: solidFetch.value,
         })
+        restoredSession = session ?? undefined
         return session ? { webId: session.webId } : undefined
       },
     })
 
-    if (decision.outcome === 'restored') {
-      restoredWebId = decision.webId
+    if (decision.outcome === 'restored' && restoredSession) {
+      // Build the DPoP-authenticated fetch from the restored session and hand BOTH the WebID
+      // and that fetch to the caller. The plugin adopts this fetch as the pod fetch BEFORE
+      // mounting storage so pod requests carry the restored authorization (NO popup).
+      result = {
+        webId: decision.webId,
+        fetch: authedFetchFromRestoredSession(restoredSession),
+      }
     }
     else {
-      // LOGIN outcome: never auto-popup. Drop a doomed pointer per the keep/drop matrix so
-      // it is not retried forever; a transient blip keeps it (the credential may survive).
+      // LOGIN outcome (or a vanished session): never auto-popup. Drop a doomed pointer per the
+      // keep/drop matrix so it is not retried forever; a transient blip keeps it.
       const issuer = remembered.issuer
       const presence = issuer
         ? await import('@jeswr/solid-session-restore').then(m => m.hasPersisted(store, new URL(issuer)))
         : 'absent'
-      if (shouldDropRememberedPointer(decision.reason, presence))
+      const reason = decision.outcome === 'login' ? decision.reason : 'restore-failed'
+      if (shouldDropRememberedPointer(reason, presence))
         pointer.clear()
     }
   }
@@ -223,7 +320,7 @@ export async function silentRestore(): Promise<string | null> {
     console.warn('[solid] silent restore failed; staying logged-out (no popup):', err instanceof Error ? err.message : err)
     return null
   }
-  return restoredWebId
+  return result
 }
 
 /** The static Client Identifier Document URL (the `client_id` for the public-client grant). */
@@ -271,17 +368,18 @@ export function disconnectSolid(): void {
   catch {
     // ignore
   }
-  // Clear the silent-restore pointer so the next load does not attempt a restore for a
-  // session the user explicitly disconnected. (The IndexedDB credential is cleared by the
-  // restore helper on a definitive invalid_grant; an explicit logout that minted a
-  // credential would forget it here too — reactive-auth's MVP flow persists none today.)
+  // Clear the silent-restore pointer SYNCHRONOUSLY so the next load does not attempt a restore
+  // for a session the user explicitly disconnected. The clear MUST complete before
+  // disconnectSolid() returns: an async clear (`void import(...).then(...)`) loses a
+  // logout→immediate-reload race — the reload's silent restore can read a not-yet-cleared
+  // pointer and resurrect a disconnected session (the roborev LOW this fixes). The pointer is
+  // a plain localStorage entry under a known key (`RememberedAccount` writes/reads exactly
+  // this key), so we remove it directly and synchronously here.
   try {
-    void import('@jeswr/solid-session-restore').then(({ RememberedAccount }) => {
-      new RememberedAccount(ELK_REMEMBERED_ACCOUNT_KEY).clear()
-    })
+    globalThis.localStorage?.removeItem(ELK_REMEMBERED_ACCOUNT_KEY)
   }
   catch {
-    // ignore — a stale pointer is harmless (silent restore fails closed)
+    // localStorage unavailable (private mode) — nothing persisted, nothing to clear
   }
 }
 
