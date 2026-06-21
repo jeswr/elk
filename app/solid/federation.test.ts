@@ -8,6 +8,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { listMembers } from '@jeswr/federation-registry'
 import { describe, expect, it } from 'vitest'
+import { buildClientIdDocument, serializeClientIdDocument } from './clientid-document'
 
 const CLIENT_ID = 'https://elk.jeswr.org/clientid.jsonld'
 const SOCIAL_SECTOR = 'https://w3id.org/jeswr/sectors/social#sector'
@@ -18,8 +19,10 @@ function readPublic(rel: string): string {
   return readFileSync(fileURLToPath(url), 'utf8')
 }
 
-describe('clientid.jsonld fedapp self-registration', () => {
-  const doc = JSON.parse(readPublic('clientid.jsonld'))
+describe('clientid.jsonld fedapp self-registration (origin-aware template)', () => {
+  // The doc is generated origin-aware by the `/clientid.jsonld` server route from this same
+  // pure template; the canonical prod membership origin is exercised here.
+  const doc = buildClientIdDocument('https://elk.jeswr.org') as Record<string, any>
 
   it('declares an fedapp:App in the social sector', () => {
     expect(doc['@type']).toBe('App')
@@ -44,6 +47,25 @@ describe('clientid.jsonld fedapp self-registration', () => {
   it('lists the OAuth callback in redirect_uris and webid scope (Solid login)', () => {
     expect(doc.redirect_uris).toContain('https://elk.jeswr.org/callback.html')
     expect(doc.scope.split(' ')).toContain('webid')
+  })
+
+  it('is ORIGIN-AWARE: the served client_id equals the served URL byte-for-byte at any origin', () => {
+    // The Solid-OIDC invariant: the doc generated for an origin names itself at that origin,
+    // so it can never drift from the URL the plugin computes from `location.origin`.
+    for (const origin of ['https://elk.jeswr.org', 'http://localhost:3000', 'https://elk-preview.vercel.app']) {
+      const d = buildClientIdDocument(origin) as Record<string, any>
+      expect(d.client_id).toBe(`${origin}/clientid.jsonld`)
+      expect(d.client_uri).toBe(`${origin}/`)
+      expect(d.redirect_uris).toContain(`${origin}/`)
+      expect(d.redirect_uris).toContain(`${origin}/callback.html`)
+      // The served bytes parse back to a doc whose client_id is its own served URL.
+      const parsed = JSON.parse(serializeClientIdDocument(origin))
+      expect(parsed.client_id).toBe(`${origin}/clientid.jsonld`)
+    }
+  })
+
+  it('rejects a non-http(s) origin (fail-closed — never a malformed client_id)', () => {
+    expect(() => buildClientIdDocument('ftp://elk.example')).toThrow(/http\(s\)/)
   })
 })
 

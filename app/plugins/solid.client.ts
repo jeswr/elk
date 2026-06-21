@@ -5,14 +5,16 @@
  * On boot it:
  *  1. Registers `@solid/reactive-authentication`'s `ReactiveFetchManager` globally, so any
  *     `fetch()` to a pod that 401s transparently upgrades with a DPoP-bound token. The
- *     provider uses Elk's STATIC Client Identifier Document (`/clientid.jsonld`) so the
- *     consent screen shows "Elk" (not a throwaway dynamic registration).
- *  2. Attempts a SILENT session restore from the persisted WebID (cross-app UX invariant
- *     #1): if a pod was connected before, reconnect without a popup while the IdP cookie
- *     lives (reactive-auth's prompt=none path), mount the pod KV storage + hydrate Elk's
- *     mirrored settings/drafts.
- *  3. Exposes `$solid` actions (`login`, `logout`) for a UI to call, plus a `<auth>` element
- *     reference for the popup flow.
+ *     provider uses Elk's ORIGIN-AWARE Client Identifier Document (`/clientid.jsonld`,
+ *     served per-origin by the server route) so the consent screen shows "Elk" (not a
+ *     throwaway dynamic registration) and the `client_id` always matches the served URL.
+ *  2. Attempts a SILENT-ONLY session restore (cross-app UX invariant #1): redeem the
+ *     persisted DPoP-bound refresh token via a token-endpoint fetch (`@jeswr/solid-session-restore`)
+ *     — NO popup, NO redirect, NO iframe. On success it mounts the pod KV storage + hydrates
+ *     Elk's mirrored settings/drafts; on ANY failure it leaves the user logged-out and defers
+ *     interactive login to an explicit user action (it NEVER auto-opens the login popup).
+ *  3. Exposes `$solid` actions (`login`, `logout`) for a UI to call; interactive login uses
+ *     the popup `getCode` only on an EXPLICIT user `login()` call, never on restore.
  *
  * Everything is a NO-OP for users who never connect a pod — Elk works exactly as before.
  * The plugin name `solid` is `.client.ts` so it never runs during SSR (reactive-auth defines
@@ -24,21 +26,26 @@ import {
   connectSolid,
   createPodStorage,
   disconnectSolid,
-  persistedSolidWebId,
+  ensureKvAcl,
   resolveOidcIssuer,
   setPodStorage,
+  silentRestore,
   solidFetch,
   solidPodBase,
   solidRestoring,
   solidWebId,
+  watchMirroredKeys,
 } from '~/solid'
 
-/** The static Client Identifier Document URL (served from `public/clientid.jsonld`). */
+/**
+ * The Client Identifier Document URL — computed from the CURRENT origin so it matches the
+ * origin-aware doc served by the `/clientid.jsonld` server route byte-for-byte (Solid-OIDC).
+ */
 function clientIdUrl(): string {
   return new URL('/clientid.jsonld', location.href).toString()
 }
 
-/** The OAuth callback URL (served from `public/callback.html`). */
+/** The OAuth callback URL (served from `public/callback.html`), origin-relative. */
 function callbackUrl(): string {
   return new URL('/callback.html', location.href).toString()
 }
@@ -107,14 +114,31 @@ export default defineNuxtPlugin(async () => {
     console.warn('[solid] reactive-auth init failed (pod features disabled):', err)
   }
 
-  /** Connect a pod by WebID: establish state, mount pod storage, hydrate mirrored keys. */
+  /**
+   * Establish pod state + mount KV storage for a CONNECTED WebID (shared by interactive
+   * login and silent restore). FAIL-CLOSED: the owner-only WAC ACL on the `${base}kv/`
+   * container is written BEFORE the KV storage is mounted / any KV value is written — if the
+   * ACL cannot be established, `ensureKvAcl` rejects and we do NOT mount the storage, so
+   * private client state (settings/drafts/emojis) can never land in a container without an
+   * owner-only ACL. Also starts watching the mirrored keys so ongoing edits push to the pod.
+   */
+  async function mountPod(): Promise<void> {
+    const base = solidPodBase.value
+    if (!base)
+      return
+    const kvContainer = `${base}kv/`
+    // Owner-only ACL FIRST — throws on failure (fail-closed; never mount on an unprotected container).
+    await ensureKvAcl(kvContainer)
+    const storage = createPodStorage(kvContainer, solidFetch.value)
+    await setPodStorage(storage)
+    // Persist ongoing settings/drafts/emoji edits to the pod (not just the initial hydrate).
+    watchMirroredKeys()
+  }
+
+  /** Connect a pod by WebID (interactive login path): establish state, then mount the pod. */
   async function login(webId: string): Promise<void> {
     await connectSolid(webId)
-    const base = solidPodBase.value
-    if (base) {
-      const storage = createPodStorage(`${base}kv/`, solidFetch.value)
-      await setPodStorage(storage)
-    }
+    await mountPod()
   }
 
   /** Disconnect the pod (Elk's Mastodon session is untouched). */
@@ -124,19 +148,28 @@ export default defineNuxtPlugin(async () => {
   }
 
   // ---- Silent session restore on load (cross-app UX invariant #1) ----
-  const restoreWebId = persistedSolidWebId()
-  if (restoreWebId) {
-    solidRestoring.value = true
-    login(restoreWebId)
-      .catch((err) => {
-        // Genuine restore failure: clear the stale pointer, fall back to manual login.
-        console.warn('[solid] silent restore failed; manual login required:', err)
-        disconnectSolid()
-      })
-      .finally(() => {
-        solidRestoring.value = false
-      })
-  }
+  // SILENT ONLY: redeem the persisted DPoP-bound refresh token via a token-endpoint fetch
+  // (no popup, no redirect, no iframe). On ANY restore failure we leave the user logged-out
+  // and DEFER interactive login to an explicit user action — we never auto-open the popup
+  // (calling the interactive `login()` here is exactly the bug this fixes). `silentRestore`
+  // returns the restored WebID on success, else null (logged-out, no popup).
+  solidRestoring.value = true
+  silentRestore()
+    .then(async (restoredWebId) => {
+      if (!restoredWebId)
+        return // nothing to restore / failed → stay logged-out, NO popup
+      // A silent restore succeeded: establish pod state for the restored WebID + mount.
+      await connectSolid(restoredWebId)
+      await mountPod()
+    })
+    .catch((err) => {
+      // Fail-closed: leave logged-out (no popup). Tear down any partial state.
+      console.warn('[solid] silent restore could not complete; staying logged-out:', err)
+      disconnectSolid()
+    })
+    .finally(() => {
+      solidRestoring.value = false
+    })
 
   return {
     provide: {
