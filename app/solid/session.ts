@@ -42,10 +42,44 @@ export const solidConnected = computed(() => solidWebId.value !== null)
  * on 401), so this returns `globalThis.fetch` bound to `globalThis`. Kept as a seam so
  * the driver/mirror depend on an injected fetch rather than the global directly — which
  * also makes them unit-testable with a stub.
+ *
+ * SECURITY: a SILENT RESTORE replaces this with a restored per-session DPoP fetch bound to one
+ * user's token. That per-session fetch MUST be dropped on logout / before a new interactive
+ * login (see {@link resetSolidFetchToDefault}) so one user's token can never be reused for
+ * another user's pod requests (cross-user token reuse).
  */
 export const solidFetch = shallowRef<typeof globalThis.fetch>(
   globalThis.fetch?.bind(globalThis),
 )
+
+/**
+ * The DEFAULT pod fetch — the reactive-auth PATCHED GLOBAL fetch (or the bare global before the
+ * manager registers). It is shared across users: it upgrades a pod 401 with a DPoP token for the
+ * CURRENTLY interactive identity, so it carries no single user's restored token. The plugin
+ * records it via {@link setDefaultSolidFetch} once the reactive-auth manager is registered;
+ * {@link resetSolidFetchToDefault} restores it (dropping any restored per-session fetch).
+ */
+let defaultSolidFetch: typeof globalThis.fetch = globalThis.fetch?.bind(globalThis)
+
+/**
+ * Record the DEFAULT pod fetch (the reactive-auth patched global). Called by the plugin once the
+ * `ReactiveFetchManager` is registered, so {@link resetSolidFetchToDefault} can later restore it.
+ */
+export function setDefaultSolidFetch(fetchImpl: typeof globalThis.fetch): void {
+  defaultSolidFetch = fetchImpl
+}
+
+/**
+ * RESET the pod fetch to the default (patched global) fetch, DROPPING any restored per-session
+ * DPoP fetch. MUST run on logout AND before any interactive login / account switch so a restored
+ * user's DPoP token can never be reused for a DIFFERENT user's profile resolution, ACL writes,
+ * or pod mounting (the cross-user-token-reuse finding). The restored fetch is only ever held in
+ * `solidFetch.value`; overwriting it here drops the last reference so its captured token does not
+ * outlive the session.
+ */
+export function resetSolidFetchToDefault(): void {
+  solidFetch.value = defaultSolidFetch
+}
 
 /**
  * The base container under which Elk writes the user's pod data. Derived from the
@@ -161,63 +195,152 @@ export interface SilentRestoreResult {
   readonly fetch: typeof globalThis.fetch
 }
 
+/** The live DPoP credential a restored fetch sends with: the access token + its bound handle. */
+export type RestoredCredential = Pick<RestoredSession, 'accessToken' | 'dpopHandle'>
+
 /**
- * Build a DPoP-AUTHENTICATED `fetch` from a restored session. The auth-attaching mechanism
- * is `oauth4webapi`'s `protectedResourceRequest` driven by the session's live `dpopHandle`
- * (created INSIDE `@jeswr/solid-session-restore` from the persisted, non-extractable key) and
- * its freshly-minted `accessToken`. We DELEGATE the DPoP proof signing + the
- * `Authorization: DPoP …` header + the server-nonce handshake to oauth4webapi (the same
+ * A SILENT refresh of the restored credential: re-mint a fresh access token (+ handle) from
+ * the persisted DPoP-bound refresh token via `@jeswr/solid-session-restore`'s `restoreSession`
+ * — a token-endpoint fetch, NEVER a popup/iframe. Returns the new credential, or `null` when
+ * the refresh itself fails (dead/revoked token, transient blip) so the caller can fail-closed
+ * rather than loop.
+ */
+export type RefreshRestoredCredential = () => Promise<RestoredCredential | null>
+
+/**
+ * Whether a `protectedResourceRequest` rejection (or a returned response) signals the access
+ * token is EXPIRED / INVALID (an `invalid_token` WWW-Authenticate challenge or a bare 401), as
+ * opposed to a DPoP-nonce challenge or an unrelated error. oauth4webapi throws a
+ * `WWWAuthenticateChallengeError` carrying `.status` for a parseable challenge; a pod that
+ * returns a 401 with no parseable challenge surfaces as a returned `Response`. We treat EITHER
+ * 401 as a token-expiry signal that warrants ONE silent refresh + retry.
+ */
+function isTokenExpiry(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { status?: unknown }).status === 401
+}
+
+/**
+ * Build a DPoP-AUTHENTICATED, REFRESH-CAPABLE `fetch` from a restored session. The
+ * auth-attaching mechanism is `oauth4webapi`'s `protectedResourceRequest` driven by the
+ * session's live `dpopHandle` (created INSIDE `@jeswr/solid-session-restore` from the
+ * persisted, non-extractable key) and its `accessToken`. We DELEGATE the DPoP proof signing +
+ * the `Authorization: DPoP …` header + the server-nonce handshake to oauth4webapi (the same
  * vetted library that minted the handle) — NEVER hand-rolling a proof.
  *
- * Resource servers may answer the first DPoP request with a `use_dpop_nonce` challenge; the
- * handle captures the server nonce from that error, so we retry ONCE with the nonce now
- * primed (RFC 9449 §8). Any other failure propagates to the caller as a normal fetch error.
+ * Two DISTINCT single retries, in order:
+ *  1. DPoP-NONCE retry (RFC 9449 §8): a server may answer the first DPoP request with a
+ *     `use_dpop_nonce` challenge; the handle captures that nonce, so we retry ONCE with it
+ *     primed. This does NOT consume the token-refresh retry.
+ *  2. TOKEN-REFRESH retry: the captured access token is short-lived. When a request gets a 401
+ *     (`invalid_token` challenge OR a bare 401 response), we run the injected `refresh` ONCE to
+ *     silently re-mint a fresh access token (+ handle) from the persisted refresh credential,
+ *     adopt it as the captured credential (so subsequent requests use the fresh token too), and
+ *     retry the request ONCE with the new credential. If `refresh` is absent or itself fails →
+ *     propagate the 401 to the caller (read paths degrade to "absent", writes see a non-ok) —
+ *     we do NOT loop.
  *
- * The returned function matches the Fetch API surface the unstorage-solid driver / mirror
- * call (`fetch(input, init)`), adapting it to `protectedResourceRequest`'s
+ * The returned function matches the Fetch API surface the unstorage-solid driver / mirror call
+ * (`fetch(input, init)`), adapting it to `protectedResourceRequest`'s
  * `(accessToken, method, url, headers, body, opts)` shape.
  */
 export function authedFetchFromRestoredSession(
-  session: Pick<RestoredSession, 'accessToken' | 'dpopHandle'>,
+  session: RestoredCredential,
+  refresh?: RefreshRestoredCredential,
 ): typeof globalThis.fetch {
+  // The CAPTURED credential — mutable so a successful silent refresh updates it in place, and
+  // every later request on this fetch uses the fresh token (not the original expired one).
+  let cred: RestoredCredential = { accessToken: session.accessToken, dpopHandle: session.dpopHandle }
+
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    // Normalise the Fetch API call into method + URL + headers + body. A `Request` object
-    // carries its own method/headers, overridden by an explicit `init`.
-    const req = input instanceof Request ? input : new Request(input, init)
-    const method = init?.method ?? req.method
+    // Normalise the Fetch API call through a SINGLE Request instance so the body bytes and the
+    // Content-Type header (e.g. a multipart/form-data boundary) are derived from the same
+    // serialization — re-serializing the body through a second Request can mint a DIFFERENT
+    // boundary than the header copied from the original (the roborev LOW). A `Request` carries
+    // its own method/headers/body, overridden by an explicit `init`.
+    const req = new Request(input, init)
+    const method = req.method
     const url = new URL(req.url)
-    const headers = new Headers(init?.headers ?? req.headers)
+    const headers = new Headers(req.headers)
     // protectedResourceRequest sets Authorization + DPoP itself; drop any stale ones.
     headers.delete('authorization')
     headers.delete('dpop')
-    // Read the body once (GET/HEAD have none). Use the init body verbatim when given so we
-    // do not consume a Request stream twice.
+    // Read the body ONCE from the SAME req (GET/HEAD have none), so the bytes match the headers
+    // (incl. the boundary in any Content-Type set by the Request body serialization).
     let body: ArrayBuffer | undefined
     if (method !== 'GET' && method !== 'HEAD') {
-      const ab = init && 'body' in init
-        ? await new Request('http://x/', { method: 'POST', body: init.body }).arrayBuffer()
-        : await req.clone().arrayBuffer()
+      const ab = await req.arrayBuffer()
       body = ab.byteLength > 0 ? ab : undefined
     }
 
     const oauth = await import('oauth4webapi')
     const send = (): Promise<Response> =>
       oauth.protectedResourceRequest(
-        session.accessToken,
+        cred.accessToken,
         method,
         url,
-        headers,
+        new Headers(headers),
         body,
-        { DPoP: session.dpopHandle, signal: init?.signal ?? req.signal ?? undefined },
+        { DPoP: cred.dpopHandle, signal: req.signal ?? undefined },
       )
+
+    // First attempt, with the DPoP-nonce retry (RFC 9449 §8) folded in. `attempt()` resolves to
+    // a Response (incl. a 401 a pod returns without a parseable challenge) or throws.
+    const attempt = async (): Promise<Response> => {
+      try {
+        return await send()
+      }
+      catch (err) {
+        // One DPoP-nonce retry once the handle has captured the server's nonce.
+        if (oauth.isDPoPNonceError(err))
+          return await send()
+        throw err
+      }
+    }
+
+    // Run the request, then — ONCE — refresh-on-401 + retry. We catch both shapes of a 401: a
+    // thrown WWWAuthenticateChallengeError (invalid_token) and a returned bare-401 Response.
     try {
-      return await send()
+      const res = await attempt()
+      if (res.status === 401 && refresh)
+        return (await refreshAndRetry(attempt, refresh)) ?? res
+      return res
     }
     catch (err) {
-      // One retry once the handle has captured the server's DPoP nonce (RFC 9449 §8).
-      if (oauth.isDPoPNonceError(err))
-        return await send()
+      if (isTokenExpiry(err) && !oauth.isDPoPNonceError(err) && refresh) {
+        const retried = await refreshAndRetry(attempt, refresh)
+        if (retried)
+          return retried
+      }
       throw err
+    }
+
+    // Run the injected silent refresh ONCE; on success adopt the fresh credential and retry the
+    // request once. Returns the retried Response, or `null` when refresh failed / the retry
+    // still 401s (caller then propagates the original 401 — no loop).
+    async function refreshAndRetry(
+      retry: () => Promise<Response>,
+      doRefresh: RefreshRestoredCredential,
+    ): Promise<Response | null> {
+      let fresh: RestoredCredential | null = null
+      try {
+        fresh = await doRefresh()
+      }
+      catch {
+        // Refresh itself threw — fail-closed, no loop.
+        return null
+      }
+      if (!fresh)
+        return null
+      cred = { accessToken: fresh.accessToken, dpopHandle: fresh.dpopHandle }
+      try {
+        const res = await retry()
+        // A second 401 after a fresh token → do NOT loop; let the caller see the failure.
+        return res.status === 401 ? null : res
+      }
+      catch {
+        // The retry itself failed (network / still-401 challenge) — no further attempts.
+        return null
+      }
     }
   }
 }
@@ -276,6 +399,22 @@ export async function silentRestore(): Promise<SilentRestoreResult | null> {
     // `{ webId } | undefined`, so the session itself is hoisted out via this closure var.
     let restoredSession: RestoredSession | undefined
 
+    // A reusable SILENT refresh of the restored credential: re-run the same refresh-grant
+    // restore (token-endpoint fetch, NO popup/iframe) to re-mint a fresh access token + handle
+    // from the persisted refresh credential when the captured token expires. Scoped to the SAME
+    // issuer/store/clientId the initial restore used. Returns null on any failure so the authed
+    // fetch fails closed rather than looping. NOTE we re-resolve `solidFetch.value` per call so
+    // the refresh discovery+grant ride the current patched fetch.
+    const refreshCredential: RefreshRestoredCredential = async () => {
+      const fresh = await restoreSession({
+        store,
+        issuer: new URL(remembered.issuer ?? restoredSession?.issuer ?? ''),
+        clientId,
+        fetch: solidFetch.value,
+      })
+      return fresh ? { accessToken: fresh.accessToken, dpopHandle: fresh.dpopHandle } : null
+    }
+
     // The single refresh-grant restore the decision drives — a token-endpoint fetch ONLY,
     // never a popup/iframe. On success it records the restored session for the caller.
     const decision = await decideSilentRestore({
@@ -294,12 +433,13 @@ export async function silentRestore(): Promise<SilentRestoreResult | null> {
     })
 
     if (decision.outcome === 'restored' && restoredSession) {
-      // Build the DPoP-authenticated fetch from the restored session and hand BOTH the WebID
-      // and that fetch to the caller. The plugin adopts this fetch as the pod fetch BEFORE
-      // mounting storage so pod requests carry the restored authorization (NO popup).
+      // Build the DPoP-authenticated, REFRESH-CAPABLE fetch from the restored session and hand
+      // BOTH the WebID and that fetch to the caller. The plugin adopts this fetch as the pod
+      // fetch BEFORE mounting storage so pod requests carry the restored authorization (NO
+      // popup) — and so a later token expiry triggers a silent re-mint, not a dead session.
       result = {
         webId: decision.webId,
-        fetch: authedFetchFromRestoredSession(restoredSession),
+        fetch: authedFetchFromRestoredSession(restoredSession, refreshCredential),
       }
     }
     else {
@@ -362,6 +502,10 @@ export async function connectSolid(webId: string): Promise<void> {
 export function disconnectSolid(): void {
   solidWebId.value = null
   solidPodBase.value = null
+  // SECURITY: drop any restored per-session DPoP fetch so a later login / account switch cannot
+  // reuse the logged-out user's token (cross-user token reuse). After disconnect the pod fetch is
+  // the default (patched global) again.
+  resetSolidFetchToDefault()
   try {
     globalThis.localStorage?.removeItem(SOLID_WEBID_KEY)
   }

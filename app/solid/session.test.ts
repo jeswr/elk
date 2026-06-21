@@ -54,6 +54,9 @@ const {
   silentRestore,
   authedFetchFromRestoredSession,
   disconnectSolid,
+  resetSolidFetchToDefault,
+  setDefaultSolidFetch,
+  solidFetch,
   ELK_REMEMBERED_ACCOUNT_KEY,
 } = await import('./session')
 const { createPodStorage } = await import('./storage')
@@ -267,6 +270,136 @@ describe('authedFetchFromRestoredSession — DPoP-bound requests via oauth4webap
     await expect(f('https://a.example/elk/kv/x')).rejects.toThrow('network down')
     expect(protectedResourceRequestMock).toHaveBeenCalledTimes(1)
   })
+
+  // ---- Medium #1: refresh-on-401 — an expired token re-mints silently + retries ONCE ----
+
+  it('refreshes the token + retries on a RETURNED bare-401, succeeding with the NEW token', async () => {
+    // First request 401s (expired token); refresh mints a fresh credential; the retry succeeds.
+    protectedResourceRequestMock
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+      .mockResolvedValueOnce(new Response('ok', { status: 200 }))
+    const refresh = vi.fn(async () => ({ accessToken: 'fresh-token-999', dpopHandle: SENTINEL_HANDLE }))
+    const f = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'), refresh)
+
+    const res = await f('https://a.example/elk/kv/x')
+
+    expect(res.status).toBe(200)
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(protectedResourceRequestMock).toHaveBeenCalledTimes(2)
+    // The RETRY went out with the FRESH token, not the original expired one.
+    expect(protectedResourceRequestMock.mock.calls[0][0]).toBe('access-token-xyz')
+    expect(protectedResourceRequestMock.mock.calls[1][0]).toBe('fresh-token-999')
+  })
+
+  it('refreshes the token + retries on a THROWN invalid_token 401 challenge (WWW-Authenticate)', async () => {
+    // oauth4webapi throws a WWWAuthenticateChallengeError (carrying .status=401) for invalid_token.
+    const challenge = Object.assign(new Error('invalid_token'), { status: 401 })
+    protectedResourceRequestMock
+      .mockRejectedValueOnce(challenge)
+      .mockResolvedValueOnce(new Response('ok', { status: 200 }))
+    const refresh = vi.fn(async () => ({ accessToken: 'fresh-token-999', dpopHandle: SENTINEL_HANDLE }))
+    const f = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'), refresh)
+
+    const res = await f('https://a.example/elk/kv/x')
+
+    expect(res.status).toBe(200)
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(protectedResourceRequestMock).toHaveBeenCalledTimes(2)
+    expect(protectedResourceRequestMock.mock.calls[1][0]).toBe('fresh-token-999')
+  })
+
+  it('after a refresh, SUBSEQUENT requests on the same fetch use the fresh token', async () => {
+    protectedResourceRequestMock
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 })) // req1 expired
+      .mockResolvedValueOnce(new Response('ok', { status: 200 })) // req1 retry (fresh)
+      .mockResolvedValueOnce(new Response('ok', { status: 200 })) // req2 (fresh, no 401)
+    const refresh = vi.fn(async () => ({ accessToken: 'fresh-token-999', dpopHandle: SENTINEL_HANDLE }))
+    const f = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'), refresh)
+
+    await f('https://a.example/elk/kv/a')
+    await f('https://a.example/elk/kv/b')
+
+    // refresh only ran once (req1); req2 went straight out on the now-captured fresh token.
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(protectedResourceRequestMock).toHaveBeenCalledTimes(3)
+    expect(protectedResourceRequestMock.mock.calls[2][0]).toBe('fresh-token-999')
+  })
+
+  it('does NOT loop when refresh FAILS: returns the original 401, refresh tried ONCE', async () => {
+    protectedResourceRequestMock.mockResolvedValue(new Response('unauthorized', { status: 401 }))
+    const refresh = vi.fn(async () => null) // dead refresh credential
+    const f = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'), refresh)
+
+    const res = await f('https://a.example/elk/kv/x')
+
+    // The caller sees the non-ok 401 (read degrades to absent / write sees non-ok) — no loop.
+    expect(res.status).toBe(401)
+    expect(refresh).toHaveBeenCalledTimes(1)
+    // One initial request only — refresh returned null so there was no retry.
+    expect(protectedResourceRequestMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does NOT loop when the refreshed token STILL 401s: refresh + ONE retry, then stop', async () => {
+    protectedResourceRequestMock.mockResolvedValue(new Response('unauthorized', { status: 401 }))
+    const refresh = vi.fn(async () => ({ accessToken: 'fresh-but-also-bad', dpopHandle: SENTINEL_HANDLE }))
+    const f = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'), refresh)
+
+    const res = await f('https://a.example/elk/kv/x')
+
+    expect(res.status).toBe(401)
+    expect(refresh).toHaveBeenCalledTimes(1)
+    // Exactly two protectedResourceRequest calls: the original + ONE post-refresh retry.
+    expect(protectedResourceRequestMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('does NOT loop when refresh THROWS: returns the original 401, no retry', async () => {
+    protectedResourceRequestMock.mockResolvedValue(new Response('unauthorized', { status: 401 }))
+    const refresh = vi.fn(async () => {
+      throw new Error('refresh blew up')
+    })
+    const f = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'), refresh)
+
+    const res = await f('https://a.example/elk/kv/x')
+
+    expect(res.status).toBe(401)
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(protectedResourceRequestMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('without a refresh callback, a 401 is returned as-is (no refresh attempted)', async () => {
+    protectedResourceRequestMock.mockResolvedValue(new Response('unauthorized', { status: 401 }))
+    const f = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'))
+
+    const res = await f('https://a.example/elk/kv/x')
+
+    expect(res.status).toBe(401)
+    expect(protectedResourceRequestMock).toHaveBeenCalledTimes(1)
+  })
+
+  // ---- Low: single-Request body/header normalization (FormData boundary consistency) ----
+
+  it('a FormData body round-trips with a Content-Type boundary that MATCHES the body bytes', async () => {
+    protectedResourceRequestMock.mockResolvedValue(new Response(null, { status: 201 }))
+    const f = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'))
+
+    const fd = new FormData()
+    fd.append('field', 'value')
+    await f('https://a.example/elk/kv/upload', { method: 'POST', body: fd })
+
+    expect(protectedResourceRequestMock).toHaveBeenCalledTimes(1)
+    const [, method, , headers, body] = protectedResourceRequestMock.mock.calls[0]
+    expect(method).toBe('POST')
+    // The Content-Type header carries a multipart boundary…
+    const ct = (headers as Headers).get('content-type') ?? ''
+    expect(ct).toMatch(/^multipart\/form-data; boundary=(.+)$/)
+    const boundary = ct.replace(/^multipart\/form-data; boundary=/, '')
+    // …and the SAME boundary appears in the serialized body bytes (no divergence from a second
+    // Request re-serialization). The body must be derived from the SAME Request as the header.
+    const decoded = new TextDecoder().decode(body as ArrayBuffer)
+    expect(decoded).toContain(`--${boundary}`)
+    expect(decoded).toContain('name="field"')
+    expect(decoded).toContain('value')
+  })
 })
 
 describe('disconnectSolid — clears the remembered-account pointer SYNCHRONOUSLY (roborev LOW)', () => {
@@ -286,5 +419,119 @@ describe('disconnectSolid — clears the remembered-account pointer SYNCHRONOUSL
     expect(localRemove).toHaveBeenCalledWith(ELK_REMEMBERED_ACCOUNT_KEY)
     // The remembered-account class's async clear() must NOT be the mechanism here.
     expect(rememberedClear).not.toHaveBeenCalled()
+  })
+})
+
+// ---- Medium #2 (SECURITY): the restored per-session fetch must NOT survive logout / a new login,
+// or one user's DPoP token could be reused for another user's pod requests. ----
+describe('solidFetch reset — no cross-user DPoP-token reuse after logout / before a new login', () => {
+  beforeEach(() => {
+    installDom()
+    restoreSessionMock.mockReset()
+    rememberedRead.mockReset()
+    rememberedClear.mockReset()
+    hasPersistedMock.mockClear()
+    windowOpen.mockClear()
+    localRemove.mockClear()
+    protectedResourceRequestMock.mockReset()
+    dpopNonceErrors = new Set()
+    decisionImpl = async () => ({ outcome: 'login', reason: 'no-account' })
+  })
+  afterEach(() => {
+    uninstallDom()
+    vi.restoreAllMocks()
+  })
+
+  it('after disconnect, solidFetch.value is the DEFAULT (patched global), NOT the restored fetch', () => {
+    const patchedGlobal = (async () => new Response()) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+    // Simulate a silent restore having adopted a restored per-session fetch.
+    const restoredFetch = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'))
+    solidFetch.value = restoredFetch
+    expect(solidFetch.value).toBe(restoredFetch)
+
+    disconnectSolid()
+
+    // The restored per-session fetch is dropped; the pod fetch is the default again.
+    expect(solidFetch.value).toBe(patchedGlobal)
+    expect(solidFetch.value).not.toBe(restoredFetch)
+  })
+
+  it('resetSolidFetchToDefault() drops the restored fetch (used before an interactive login)', () => {
+    const patchedGlobal = (async () => new Response()) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+    const restoredFetch = authedFetchFromRestoredSession(restoredSession('https://a.example/#me'))
+    solidFetch.value = restoredFetch
+
+    // The plugin's login() calls this BEFORE resolving the (possibly different) user's profile.
+    resetSolidFetchToDefault()
+
+    expect(solidFetch.value).toBe(patchedGlobal)
+  })
+
+  it('a login after a restore+logout does NOT carry the prior restored user\'s DPoP token', async () => {
+    const patchedGlobal = (async () => new Response('global', { status: 200 })) as typeof globalThis.fetch
+    setDefaultSolidFetch(patchedGlobal)
+
+    // 1) Silent restore for user A → adopt A's restored DPoP fetch (what the plugin does).
+    const aliceWebId = 'https://alice.pod.example/profile/card#me'
+    rememberedRead.mockReturnValue({ webId: aliceWebId, issuer: 'https://issuer.example/' })
+    restoreSessionMock.mockResolvedValue({ ...restoredSession(aliceWebId), issuer: 'https://issuer.example/' })
+    decisionImpl = async (inputs) => {
+      const r = await inputs.restoreIssuer('https://issuer.example/')
+      return { outcome: 'restored', webId: r.webId, issuer: 'https://issuer.example/' }
+    }
+    const restored = await silentRestore()
+    expect(restored).not.toBeNull()
+    solidFetch.value = restored!.fetch // plugin adopts A's restored authed fetch
+    expect(solidFetch.value).not.toBe(patchedGlobal)
+
+    // 2) User A logs out → restored fetch must be dropped.
+    disconnectSolid()
+    expect(solidFetch.value).toBe(patchedGlobal)
+
+    // 3) A subsequent (interactive) login resets to the default first — so the pod fetch in use
+    //    is the patched global, NEVER A's restored DPoP fetch. Prove a pod request now does NOT
+    //    go through A's protectedResourceRequest (A's token-bearing path).
+    resetSolidFetchToDefault()
+    protectedResourceRequestMock.mockClear()
+    await solidFetch.value('https://bob.pod.example/profile/card#me')
+    expect(protectedResourceRequestMock).not.toHaveBeenCalled()
+  })
+
+  it('the restored fetch CAN re-mint via refresh, re-invoking restoreSession for the SAME issuer', async () => {
+    // Through the full silentRestore path: the built fetch is refresh-capable and the refresh
+    // callback re-runs restoreSession (the silent refresh-grant seam) for the remembered issuer.
+    const webId = 'https://carol.pod.example/profile/card#me'
+    rememberedRead.mockReturnValue({ webId, issuer: 'https://issuer.example/' })
+    // First restore (initial) yields token1; the refresh re-invocation yields token2.
+    restoreSessionMock
+      .mockResolvedValueOnce({ webId, accessToken: 'token1', dpopHandle: SENTINEL_HANDLE, issuer: 'https://issuer.example/' })
+      .mockResolvedValueOnce({ webId, accessToken: 'token2', dpopHandle: SENTINEL_HANDLE, issuer: 'https://issuer.example/' })
+    decisionImpl = async (inputs) => {
+      const r = await inputs.restoreIssuer('https://issuer.example/')
+      return { outcome: 'restored', webId: r.webId, issuer: 'https://issuer.example/' }
+    }
+
+    const restored = await silentRestore()
+    expect(restored).not.toBeNull()
+
+    // First pod request 401s (token1 expired) → refresh re-invokes restoreSession → token2 → retry ok.
+    protectedResourceRequestMock
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+      .mockResolvedValueOnce(new Response('ok', { status: 200 }))
+    const res = await restored!.fetch('https://carol.pod.example/elk/kv/x')
+
+    expect(res.status).toBe(200)
+    // restoreSession ran twice: the initial restore + ONE silent refresh.
+    expect(restoreSessionMock).toHaveBeenCalledTimes(2)
+    // The refresh re-invocation used the SAME issuer + clientId as the initial restore.
+    const refreshCall = restoreSessionMock.mock.calls[1][0] as { issuer: URL, clientId?: string }
+    expect(refreshCall.issuer.href).toBe('https://issuer.example/')
+    expect(refreshCall.clientId).toBe('https://elk.example/clientid.jsonld')
+    // The retry used the freshly minted token2.
+    expect(protectedResourceRequestMock.mock.calls[1][0]).toBe('token2')
+    // No popup at any point.
+    expect(windowOpen).not.toHaveBeenCalled()
   })
 })

@@ -27,7 +27,9 @@ import {
   createPodStorage,
   disconnectSolid,
   ensureKvAcl,
+  resetSolidFetchToDefault,
   resolveOidcIssuer,
+  setDefaultSolidFetch,
   setPodStorage,
   silentRestore,
   solidFetch,
@@ -107,8 +109,13 @@ export default defineNuxtPlugin(async () => {
     const provider = new DPoPTokenProvider(callbackUrl(), getCode, getIssuer)
     manager = new ReactiveFetchManager([provider])
     manager.registerGlobally()
-    // Once the global fetch is patched, it IS the authed pod fetch.
-    solidFetch.value = globalThis.fetch.bind(globalThis)
+    // Once the global fetch is patched, it IS the authed pod fetch — and the DEFAULT pod fetch
+    // (shared across users; it upgrades a pod 401 for the CURRENTLY interactive identity). Record
+    // it as the default so logout / a new interactive login can RESET back to it, dropping any
+    // restored per-session fetch (the cross-user-token-reuse finding).
+    const patched = globalThis.fetch.bind(globalThis)
+    setDefaultSolidFetch(patched)
+    solidFetch.value = patched
   }
   catch (err) {
     console.warn('[solid] reactive-auth init failed (pod features disabled):', err)
@@ -137,6 +144,11 @@ export default defineNuxtPlugin(async () => {
 
   /** Connect a pod by WebID (interactive login path): establish state, then mount the pod. */
   async function login(webId: string): Promise<void> {
+    // Drop any restored per-session fetch BEFORE this (possibly different) user's profile is
+    // resolved / pod is mounted — an interactive login / account switch must NOT carry the prior
+    // restored user's DPoP token. The interactive identity uses the reactive-auth patched global
+    // fetch (which upgrades the 401 for THIS login).
+    resetSolidFetchToDefault()
     await connectSolid(webId)
     await mountPod()
   }
@@ -144,6 +156,8 @@ export default defineNuxtPlugin(async () => {
   /** Disconnect the pod (Elk's Mastodon session is untouched). */
   function logout(): void {
     clearPodStorage()
+    // disconnectSolid() itself resets the pod fetch to the default (dropping the restored
+    // per-session DPoP fetch) — see its security note — so a later login can't reuse the token.
     disconnectSolid()
   }
 
