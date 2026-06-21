@@ -1,6 +1,7 @@
 // AUTHORED-BY Claude Opus 4.8 (Fable unavailable) — re-review/upgrade candidate.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  commitHydratedToLocal,
   createPodStorage,
   hydrateFromPod,
   MIRRORED_KEYS,
@@ -74,12 +75,44 @@ describe('hydrateFromPod / pushToPod', () => {
     }
   }
 
-  it('hydrates only the keys the pod actually has', async () => {
+  it('read phase: reads only the keys the pod actually has into a map — and writes NOTHING to localStorage', async () => {
     const storage = fakeStorage({ 'elk-settings': { fontSize: '18px' } })
-    const hydrated = await hydrateFromPod(storage as never)
-    expect(hydrated).toEqual(['elk-settings'])
-    expect(readLocal('elk-settings')).toEqual({ fontSize: '18px' })
+    const read = await hydrateFromPod(storage as never)
+    // The read phase returns a map of present pod keys only…
+    expect([...read.keys()]).toEqual(['elk-settings'])
+    expect(read.get('elk-settings')).toEqual({ fontSize: '18px' })
+    expect(read.has('elk-drafts')).toBe(false)
+    // …and is PURE: it must not touch localStorage (the commit phase does that, atomically).
+    expect(readLocal('elk-settings')).toBeNull()
     expect(readLocal('elk-drafts')).toBeNull()
+  })
+
+  it('commit phase: commitHydratedToLocal synchronously writes the whole read map to localStorage', async () => {
+    const storage = fakeStorage({ 'elk-settings': { fontSize: '18px' }, 'elk-drafts': { home: [1] } })
+    const read = await hydrateFromPod(storage as never)
+    const committed = commitHydratedToLocal(read)
+    expect(committed.sort()).toEqual(['elk-drafts', 'elk-settings'])
+    expect(readLocal('elk-settings')).toEqual({ fontSize: '18px' })
+    expect(readLocal('elk-drafts')).toEqual({ home: [1] })
+    expect(readLocal('elk-custom-emojis')).toBeNull()
+  })
+
+  it('read phase early-aborts the reads the moment isCurrent() goes stale (no later key read)', async () => {
+    const storage = fakeStorage({ 'elk-settings': { a: 1 }, 'elk-drafts': { b: 2 }, 'elk-custom-emojis': { c: 3 } })
+    let calls = 0
+    // Current for the first key's pre-read guard, stale thereafter → reads key #1 only, then aborts
+    // before reading keys #2/#3 (the pre-read guard short-circuits the next iterations).
+    const isCurrent = () => ++calls <= 1
+    const read = await hydrateFromPod(storage as never, isCurrent)
+    expect(storage.getItem).toHaveBeenCalledTimes(1)
+    expect([...read.keys()]).toEqual(['elk-settings'])
+  })
+
+  it('read phase with no guard reads EVERY key (non-vacuity for the early-abort test)', async () => {
+    const storage = fakeStorage({ 'elk-settings': { a: 1 }, 'elk-drafts': { b: 2 }, 'elk-custom-emojis': { c: 3 } })
+    const read = await hydrateFromPod(storage as never)
+    expect(storage.getItem).toHaveBeenCalledTimes(3)
+    expect([...read.keys()].sort()).toEqual(['elk-custom-emojis', 'elk-drafts', 'elk-settings'])
   })
 
   it('pushes only locally-present keys', async () => {

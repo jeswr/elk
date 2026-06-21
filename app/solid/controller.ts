@@ -21,7 +21,7 @@ import type { MirroredKey } from './storage'
 import { writeOwnerOnlyAcl } from './acl'
 import { mirrorStatus } from './mirror'
 import { solidFetch, solidPodBase, solidWebId } from './session'
-import { hydrateFromPod, MIRRORED_KEYS, pushKeyToPod } from './storage'
+import { commitHydratedToLocal, hydrateFromPod, MIRRORED_KEYS, pushKeyToPod } from './storage'
 
 /** The live pod KV storage instance, set by the plugin on connect, cleared on disconnect. */
 let podStorage: Storage | null = null
@@ -83,7 +83,25 @@ export function kvAclEnsured(kvContainer: string): boolean {
 }
 
 /**
- * Install the live pod storage instance + hydrate mirrored keys from the pod.
+ * Synchronously disable the PREVIOUS pod-storage singleton + its watcher + any pending debounced
+ * push timers (roborev Medium — old singleton active during a new hydrate). Called at the very
+ * start of {@link setPodStorage}, BEFORE the new hydrate's `await`, so that during a login /
+ * account-switch no write (incl. a queued debounced push) can target the PRIOR pod while the new
+ * pod's storage is being read. Distinct from {@link clearPodStorage} (full disconnect): this does
+ * NOT clear the ACL memo — the plugin establishes the new container's ACL BEFORE calling
+ * `setPodStorage`, and the memo's connect/disconnect lifecycle is owned there.
+ */
+function disablePreviousPodStorage(): void {
+  podStorage = null
+  unwatchMirroredKeys()
+  for (const t of pushTimers.values())
+    clearTimeout(t)
+  pushTimers.clear()
+}
+
+/**
+ * Install the live pod storage instance + hydrate mirrored keys from the pod — ATOMIC w.r.t.
+ * the restore generation.
  *
  * NOTE: this does NOT reset the per-session ACL memo (`aclEnsured` / `kvAclPromises`) — the
  * plugin establishes the kv/ owner-only ACL via {@link ensureKvAcl} BEFORE calling this, so
@@ -92,36 +110,53 @@ export function kvAclEnsured(kvContainer: string): boolean {
  * {@link clearPodStorage} on disconnect (a different WebID ⇒ a different container URL, so a
  * carried-over memo can never apply a stale ACL decision to the wrong pod).
  *
- * SILENT-RESTORE RACE (roborev HIGH — the DEEPEST race window): both the pod-storage singleton
- * install (`podStorage = storage`) AND the per-mirrored-key `localStorage` writes inside
- * {@link hydrateFromPod} are shared/persistent state mutations that run during/after `await`s. A
- * login()/logout() racing the in-flight silent restore must not let a now-stale restore install
- * the OLD user's storage singleton or mirror their data over the newer session. We therefore:
- *   1. HYDRATE FIRST, with the `isCurrent` guard threaded INTO the hydrate loop so it checks
- *      BEFORE each awaited pod read AND BEFORE each `localStorage` write, aborting the moment the
- *      restore goes stale (no further mirrored-key write happens).
- *   2. Install the singleton (`podStorage = storage`) ONLY if STILL current after the hydrate —
- *      the unavoidable side-effect is done as LATE as possible, immediately preceded by an
- *      `isCurrent()` check, minimizing the stale-write window. If the restore went stale we leave
- *      `podStorage` untouched (we never installed it) and the caller does NOT start the watcher.
- * The interactive login() path passes no guard (it is itself the latest action) so it always
- * hydrates + installs unchanged.
+ * SILENT-RESTORE RACE (roborev HIGH — the DEEPEST race window, ATOMIC fix): the per-mirrored-key
+ * `localStorage` writes, the pod-storage singleton install (`podStorage = storage`), AND the
+ * mirror watcher are all shared/persistent state mutations that previously ran one-at-a-time
+ * across `await`s — so a login()/logout() racing the in-flight silent restore could leave a
+ * PARTIAL stale write (some of the OLD user's keys written, then aborted). We now make the whole
+ * install ATOMIC w.r.t. the generation:
+ *   1. READ PHASE — read ALL mirrored pod keys into an in-memory map ({@link hydrateFromPod}).
+ *      This is the only part that awaits. It may early-abort the reads if the restore goes stale
+ *      (no harm — nothing is written during the read phase).
+ *   2. ONE final `isCurrent()` check.
+ *   3. If still current: SYNCHRONOUSLY (NO `await` anywhere between the final check and the end of
+ *      these writes) commit the WHOLE batch to `localStorage`, install the singleton, AND start the
+ *      watcher. Because the block is synchronous it is atomic w.r.t. the microtask/event loop, so no
+ *      generation bump can interleave. If STALE at the final check: write NOTHING, install NOTHING,
+ *      start no watcher (the newer session's state stands untouched).
+ * The interactive login() path passes no guard (it is itself the latest action) so it always reads
+ * every key + commits + installs + watches.
  */
 export async function setPodStorage(storage: Storage, isCurrent?: () => boolean): Promise<void> {
-  // Hydrate FIRST (gated), reading into localStorage only while the restore is still current. We
-  // do NOT install the singleton yet so a stale restore that aborts mid-hydrate leaves no storage
-  // installed (nothing to tear down).
+  // 0. CLEAR THE PREVIOUS SINGLETON + WATCHER FIRST (roborev Medium — old singleton active during
+  // a new hydrate). An UNGUARDED interactive login / account-switch would otherwise leave the
+  // PRIOR `podStorage` + its watcher live throughout the new read phase's `await` window, so a
+  // settings/draft edit (or a pending debounced push) could be flushed to the PRIOR pod via
+  // `schedulePodSync`. We synchronously disable the previous singleton + stop the previous watcher
+  // + drop pending push timers BEFORE awaiting the new hydrate, so NO write can target the old pod
+  // during the switch. (The ACL memo is NOT cleared here — that is connect/disconnect lifecycle,
+  // owned by the plugin's ensureKvAcl-before-mount ordering.) The new singleton + watcher are
+  // re-installed only on success, atomically, in step 3 below.
+  disablePreviousPodStorage()
+  // 1. READ PHASE (the only awaited part): pull every mirrored pod key into an in-memory map.
+  // Nothing is written yet, so an early-abort here is harmless.
+  let read: Map<MirroredKey, unknown>
   try {
-    await hydrateFromPod(storage, isCurrent)
+    read = await hydrateFromPod(storage, isCurrent)
   }
   catch {
-    // hydrate best-effort; a fresh device with no pod copy is fine
+    // hydrate best-effort; a fresh device with no pod copy is fine.
+    read = new Map()
   }
-  // A login()/logout() may have raced during the hydrate — install the singleton ONLY if still
-  // current. A stale restore installs NOTHING (the newer session's podStorage, if any, stands).
+  // 2. ONE final generation check. A login()/logout() may have raced during the read phase.
   if (isCurrent && !isCurrent())
-    return
+    return // STALE: write NOTHING, install NOTHING, start no watcher.
+  // 3. SYNCHRONOUS atomic commit — NO `await` from here to the end of the function, so no
+  // generation bump can interleave between the check above and these writes.
+  commitHydratedToLocal(read)
   podStorage = storage
+  watchMirroredKeys()
 }
 
 /** Tear down the pod storage instance (on Solid disconnect / logout). */

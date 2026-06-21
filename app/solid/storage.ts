@@ -87,42 +87,60 @@ export function writeLocal(key: MirroredKey, value: unknown): void {
 }
 
 /**
- * Pull each mirrored key from the pod into localStorage (the connect-time hydrate). Used
- * when a pod copy should win on a fresh device. Missing pod keys are left untouched (the
- * local default / existing value stands). Returns the set of keys actually hydrated.
+ * READ PHASE of the connect-time hydrate (NO writes). Reads each mirrored key from the pod
+ * into an in-memory map (the awaited `storage.getItem` calls) and returns it. The caller then
+ * does ONE final `isCurrent()` check and, only if still current, SYNCHRONOUSLY commits the
+ * whole map to `localStorage` via {@link commitHydratedToLocal} — so the writes are ATOMIC
+ * w.r.t. the restore generation (all-or-nothing; no key is ever written unless the whole batch
+ * is, and only when current). This eliminates the partial-stale-write class entirely.
  *
- * SILENT-RESTORE RACE (roborev HIGH — the DEEPEST race window): each `writeLocal` is a
- * persistent `localStorage` write that lands the RESTORED user's mirrored data into local
- * state, and it runs AFTER an `await storage.getItem(...)`. A login()/logout() racing the
- * in-flight silent restore can fire during ANY of those awaits, so a now-stale restore must
- * NOT mirror the OLD user's `elk-settings`/`elk-drafts`/`elk-custom-emojis` over the newer
- * session's local state. The OPTIONAL `isCurrent` guard (the captured restore generation) is
- * therefore checked BEFORE EACH awaited pod read AND BEFORE EACH `localStorage` write; the
- * MOMENT it goes stale the hydrate ABORTS — it writes nothing further and returns the keys
- * hydrated so far (the caller — `setPodStorage` — then refuses to install/keep the singleton
- * and never starts the watcher). The interactive login()/manual hydrate path passes no guard
- * (it is itself the latest action), so its behaviour is unchanged.
+ * SILENT-RESTORE RACE (roborev HIGH — the DEEPEST race window): a login()/logout() racing the
+ * in-flight silent restore must NOT let a now-stale restore mirror the OLD user's
+ * `elk-settings`/`elk-drafts`/`elk-custom-emojis` over the newer session's local state. The
+ * OPTIONAL `isCurrent` guard (the captured restore generation) is checked BEFORE EACH awaited
+ * pod read — a no-harm early-abort, since nothing is written during the read phase: if it goes
+ * stale we simply stop reading and return whatever was read so far. The DECISIVE, atomic check
+ * is the caller's single final `isCurrent()` immediately before the synchronous commit; this
+ * read-phase guard is only an optimisation that avoids reading the OLD user's later keys. A
+ * key whose pod read throws is just omitted from the map (a single key failing must not abort
+ * the others). The interactive login()/manual hydrate path passes no guard (it is itself the
+ * latest action), so it reads every key.
  */
-export async function hydrateFromPod(storage: Storage, isCurrent?: () => boolean): Promise<MirroredKey[]> {
-  const hydrated: MirroredKey[] = []
+export async function hydrateFromPod(
+  storage: Storage,
+  isCurrent?: () => boolean,
+): Promise<Map<MirroredKey, unknown>> {
+  const read = new Map<MirroredKey, unknown>()
   for (const key of MIRRORED_KEYS) {
-    // BEFORE the awaited pod read: a stale restore must not even read the OLD user's pod.
+    // BEFORE the awaited pod read: a stale restore need not even read the OLD user's later
+    // keys. Early-abort is harmless — nothing has been written; the caller's final check + the
+    // all-or-nothing commit are what actually enforce correctness.
     if (isCurrent && !isCurrent())
-      return hydrated
+      return read
     try {
       const value = await storage.getItem(podKey(key))
-      // BEFORE the localStorage write: a login()/logout() may have raced during getItem().
-      // If so, abort immediately — never mirror the stale restored user's data into local state.
-      if (isCurrent && !isCurrent())
-        return hydrated
-      if (value != null) {
-        writeLocal(key, value)
-        hydrated.push(key)
-      }
+      if (value != null)
+        read.set(key, value)
     }
     catch {
       // a single key failing to hydrate must not abort the others
     }
+  }
+  return read
+}
+
+/**
+ * COMMIT PHASE of the hydrate — SYNCHRONOUS, NO `await`. Writes every read mirrored value into
+ * `localStorage` in one go. The caller MUST do its final `isCurrent()` check IMMEDIATELY before
+ * calling this and MUST NOT `await` anything between that check and this call: because this body
+ * is fully synchronous it runs atomically w.r.t. the microtask/event loop, so no generation bump
+ * can interleave between the check and the writes. Returns the keys committed.
+ */
+export function commitHydratedToLocal(read: Map<MirroredKey, unknown>): MirroredKey[] {
+  const hydrated: MirroredKey[] = []
+  for (const [key, value] of read) {
+    writeLocal(key, value)
+    hydrated.push(key)
   }
   return hydrated
 }

@@ -21,6 +21,7 @@ import {
   solidPodBase,
   solidWebId,
 } from './session'
+import { MIRRORED_KEYS } from './storage'
 
 const WEBID = 'https://alice.pod.example/profile/card#me'
 const POD_BASE = 'https://alice.pod.example/elk/'
@@ -61,9 +62,9 @@ function uninstallDom(): void {
   delete (globalThis as any).window
 }
 
-/** Build a fake unstorage instance recording setItem calls. */
-function fakeStorage() {
-  const data = new Map<string, unknown>()
+/** Build a fake unstorage instance recording setItem calls (optionally seeded with pod data). */
+function fakeStorage(initial: Record<string, unknown> = {}) {
+  const data = new Map<string, unknown>(Object.entries(initial))
   return {
     getItem: vi.fn(async (k: string) => (data.has(k) ? data.get(k) : null)),
     setItem: vi.fn(async (k: string, v: unknown) => void data.set(k, v)),
@@ -428,6 +429,170 @@ describe('setPodStorage hydrate race — a login()/logout() DURING the hydrate w
     release()
     await mounting
     expect(getItem).toHaveBeenCalledTimes(3)
+  })
+})
+
+// ---- roborev Medium (old singleton active during a new hydrate): an account-switch / interactive
+// login installs a NEW pod storage while the PREVIOUS singleton + watcher are still live. If the new
+// hydrate's await window leaves the old singleton active, a mirrored-key edit (or a pending debounced
+// push) can be flushed to the PRIOR pod. setPodStorage must SYNCHRONOUSLY disable the previous
+// singleton + watcher + pending timers BEFORE awaiting the new hydrate, and re-install (atomically)
+// only on success. ----
+describe('setPodStorage account-switch — clears the OLD singleton/watcher before the new hydrate (roborev Medium)', () => {
+  let env: ReturnType<typeof installDom>
+  beforeEach(() => {
+    env = installDom()
+    solidWebId.value = WEBID
+    solidPodBase.value = POD_BASE
+  })
+  afterEach(() => {
+    clearPodStorage()
+    solidWebId.value = null
+    solidPodBase.value = null
+    uninstallDom()
+    vi.restoreAllMocks()
+  })
+
+  /** A storage whose hydrate getItem SUSPENDS so we can act during the new hydrate's await window. */
+  function suspendableEmptyStorage() {
+    let release!: () => void
+    const firstRead = new Promise<void>(r => (release = r))
+    let firstReadStarted!: () => void
+    const started = new Promise<void>(r => (firstReadStarted = r))
+    let first = true
+    return {
+      storage: {
+        getItem: vi.fn(async () => {
+          if (first) {
+            first = false
+            firstReadStarted()
+            await firstRead
+          }
+          return null
+        }),
+        setItem: vi.fn(async () => {}),
+      },
+      release,
+      started,
+    }
+  }
+
+  it('a settings edit DURING the new hydrate does NOT push to the OLD pod (old singleton/watcher cleared first)', async () => {
+    vi.useFakeTimers()
+    try {
+      // FIRST user/pod is mounted with a live watcher.
+      const oldStorage = fakeStorage()
+      await setPodStorage(oldStorage as never) // installs old singleton + watcher (atomically)
+      expect(env.listeners.get('storage')?.size).toBe(1)
+
+      // Now an account-switch begins: setPodStorage for the NEW pod, whose hydrate suspends.
+      const { storage: newStorage, release, started } = suspendableEmptyStorage()
+      const mounting = setPodStorage(newStorage as never)
+      await started // we are now inside the new hydrate's await window
+
+      // The OLD singleton + watcher must already be disabled (synchronously, before the await).
+      // A mirrored-key edit dispatched now must NOT be pushed to the OLD pod.
+      globalThis.localStorage.setItem('elk-settings', JSON.stringify({ x: 1 }))
+      ;(globalThis as any).window.dispatchEvent({ type: 'storage', key: 'elk-settings' } as unknown as StorageEvent)
+      await vi.advanceTimersByTimeAsync(2000)
+      await Promise.resolve()
+      expect(oldStorage.setItem).not.toHaveBeenCalled() // nothing leaked to the prior pod
+
+      // Finish the switch: the NEW singleton + watcher install atomically on success.
+      release()
+      await mounting
+      expect(env.listeners.get('storage')?.size).toBe(1) // exactly one watcher (the new one)
+      expect(podConnected()).toBe(true)
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a PENDING debounced push to the OLD pod is dropped when a switch begins (timers cleared)', async () => {
+    vi.useFakeTimers()
+    try {
+      const oldStorage = fakeStorage()
+      await setPodStorage(oldStorage as never)
+      // Queue a debounced push to the OLD pod (timer not yet fired).
+      schedulePodSync('elk-settings')
+
+      // Begin the switch — setPodStorage must clear the pending timer synchronously, before any await.
+      const { storage: newStorage, release } = suspendableEmptyStorage()
+      const mounting = setPodStorage(newStorage as never)
+
+      // Let the OLD debounce window fully elapse: the dropped timer must never fire to the old pod.
+      await vi.advanceTimersByTimeAsync(5000)
+      await Promise.resolve()
+      expect(oldStorage.setItem).not.toHaveBeenCalled()
+
+      release()
+      await mounting
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ---- Non-vacuity of the ATOMIC final check (roborev HIGH): the synchronous batch-commit + install
+// must be GATED by the single final isCurrent() — proven by the race test failing if the check is
+// dropped. Here we assert the positive: when current, the commit + install happen; when made stale
+// exactly at the final check (after all reads completed current), NOTHING is committed/installed. ----
+describe('setPodStorage atomic final-check non-vacuity (roborev HIGH)', () => {
+  let env: ReturnType<typeof installDom>
+  beforeEach(() => {
+    env = installDom()
+    solidWebId.value = WEBID
+    solidPodBase.value = POD_BASE
+  })
+  afterEach(() => {
+    clearPodStorage()
+    solidWebId.value = null
+    solidPodBase.value = null
+    uninstallDom()
+    vi.restoreAllMocks()
+  })
+
+  it('stale EXACTLY at the final check (all reads were current) → NO commit, NO singleton, NO watcher', async () => {
+    // The guard stays current through ALL the read-phase pre-read checks, then goes stale on the
+    // FINAL check in setPodStorage — proving the final synchronous gate (not just the read guard)
+    // is what blocks the commit + install of an all-keys-read map.
+    const storage = fakeStorage({
+      'elk-settings': { fontSize: '99px' },
+      'elk-drafts': { home: ['stale'] },
+      'elk-custom-emojis': { stale: true },
+    })
+    // MIRRORED_KEYS.length pre-read checks (all current) + 1 final check (stale).
+    let calls = 0
+    const isCurrent = () => ++calls <= MIRRORED_KEYS.length
+
+    await setPodStorage(storage as never, isCurrent)
+
+    // All 3 keys were READ (read-phase ran fully current)…
+    expect(storage.getItem).toHaveBeenCalledTimes(MIRRORED_KEYS.length)
+    // …but the final check went stale → NOTHING committed to localStorage, no singleton, no watcher.
+    expect(env.store.has('elk-settings')).toBe(false)
+    expect(env.store.has('elk-drafts')).toBe(false)
+    expect(env.store.has('elk-custom-emojis')).toBe(false)
+    expect(podConnected()).toBe(false)
+    expect(env.listeners.get('storage')?.size ?? 0).toBe(0)
+  })
+
+  it('current at the final check → commits ALL keys + installs singleton + starts watcher (not vacuous)', async () => {
+    const storage = fakeStorage({
+      'elk-settings': { fontSize: '15px' },
+      'elk-drafts': { home: ['d'] },
+      'elk-custom-emojis': { a: 1 },
+    })
+    // Always current.
+    await setPodStorage(storage as never, () => true)
+
+    expect(JSON.parse(env.store.get('elk-settings')!)).toEqual({ fontSize: '15px' })
+    expect(JSON.parse(env.store.get('elk-drafts')!)).toEqual({ home: ['d'] })
+    expect(JSON.parse(env.store.get('elk-custom-emojis')!)).toEqual({ a: 1 })
+    expect(podConnected()).toBe(true)
+    expect(env.listeners.get('storage')?.size).toBe(1) // watcher started by the atomic block
   })
 })
 
