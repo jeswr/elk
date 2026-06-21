@@ -91,15 +91,37 @@ export function kvAclEnsured(kvContainer: string): boolean {
  * redundant ACL re-PUT). The memo's lifecycle boundary is connect/disconnect: it is reset by
  * {@link clearPodStorage} on disconnect (a different WebID ⇒ a different container URL, so a
  * carried-over memo can never apply a stale ACL decision to the wrong pod).
+ *
+ * SILENT-RESTORE RACE (roborev HIGH — the DEEPEST race window): both the pod-storage singleton
+ * install (`podStorage = storage`) AND the per-mirrored-key `localStorage` writes inside
+ * {@link hydrateFromPod} are shared/persistent state mutations that run during/after `await`s. A
+ * login()/logout() racing the in-flight silent restore must not let a now-stale restore install
+ * the OLD user's storage singleton or mirror their data over the newer session. We therefore:
+ *   1. HYDRATE FIRST, with the `isCurrent` guard threaded INTO the hydrate loop so it checks
+ *      BEFORE each awaited pod read AND BEFORE each `localStorage` write, aborting the moment the
+ *      restore goes stale (no further mirrored-key write happens).
+ *   2. Install the singleton (`podStorage = storage`) ONLY if STILL current after the hydrate —
+ *      the unavoidable side-effect is done as LATE as possible, immediately preceded by an
+ *      `isCurrent()` check, minimizing the stale-write window. If the restore went stale we leave
+ *      `podStorage` untouched (we never installed it) and the caller does NOT start the watcher.
+ * The interactive login() path passes no guard (it is itself the latest action) so it always
+ * hydrates + installs unchanged.
  */
-export async function setPodStorage(storage: Storage): Promise<void> {
-  podStorage = storage
+export async function setPodStorage(storage: Storage, isCurrent?: () => boolean): Promise<void> {
+  // Hydrate FIRST (gated), reading into localStorage only while the restore is still current. We
+  // do NOT install the singleton yet so a stale restore that aborts mid-hydrate leaves no storage
+  // installed (nothing to tear down).
   try {
-    await hydrateFromPod(storage)
+    await hydrateFromPod(storage, isCurrent)
   }
   catch {
     // hydrate best-effort; a fresh device with no pod copy is fine
   }
+  // A login()/logout() may have raced during the hydrate — install the singleton ONLY if still
+  // current. A stale restore installs NOTHING (the newer session's podStorage, if any, stands).
+  if (isCurrent && !isCurrent())
+    return
+  podStorage = storage
 }
 
 /** Tear down the pod storage instance (on Solid disconnect / logout). */

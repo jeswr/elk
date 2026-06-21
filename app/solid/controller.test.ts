@@ -7,12 +7,20 @@ import {
   clearPodStorage,
   ensureKvAcl,
   kvAclEnsured,
+  podConnected,
   schedulePodSync,
   setPodStorage,
   unwatchMirroredKeys,
   watchMirroredKeys,
 } from './controller'
-import { solidFetch, solidPodBase, solidWebId } from './session'
+import {
+  beginRestoreGeneration,
+  bumpRestoreGeneration,
+  isRestoreGenerationCurrent,
+  solidFetch,
+  solidPodBase,
+  solidWebId,
+} from './session'
 
 const WEBID = 'https://alice.pod.example/profile/card#me'
 const POD_BASE = 'https://alice.pod.example/elk/'
@@ -278,6 +286,148 @@ describe('watchMirroredKeys — ongoing edits push to the pod (Medium #2)', () =
     expect(env.listeners.get('storage')?.size).toBe(1)
     unwatchMirroredKeys()
     expect(env.listeners.get('storage')?.size ?? 0).toBe(0)
+  })
+})
+
+// ---- roborev HIGH (the DEEPEST race window, definitive round): setPodStorage's hydrate writes
+// the RESTORED user's mirrored keys (elk-settings/elk-drafts/elk-custom-emojis) into localStorage
+// AFTER each awaited pod read, and installs the pod-storage singleton. A login()/logout() racing
+// the in-flight silent restore must let a now-stale restore mirror NO data, install NO singleton,
+// and start NO watcher. We drive the PRODUCTION setPodStorage(storage, isCurrent) over the SAME
+// generation-guard primitives the plugin uses (beginRestoreGeneration before the restore;
+// isRestoreGenerationCurrent threaded in as isCurrent; a login/logout bumps the generation). ----
+describe('setPodStorage hydrate race — a login()/logout() DURING the hydrate writes NO stale mirrored keys / no singleton (roborev HIGH)', () => {
+  let env: ReturnType<typeof installDom>
+  beforeEach(() => {
+    env = installDom()
+    solidWebId.value = WEBID
+    solidPodBase.value = POD_BASE
+  })
+  afterEach(() => {
+    clearPodStorage()
+    solidWebId.value = null
+    solidPodBase.value = null
+    uninstallDom()
+    vi.restoreAllMocks()
+  })
+
+  /**
+   * A fake unstorage whose getItem SUSPENDS on the FIRST mirrored-key read until released, so a
+   * racing login()/logout() can be injected mid-hydrate. Records every setItem (it should never be
+   * called here — hydrate writes localStorage via writeLocal, not the pod). `pod` seeds the pod's
+   * mirrored values so a non-gated hydrate WOULD write them to localStorage.
+   */
+  function suspendableStorage(pod: Record<string, unknown>) {
+    let release!: () => void
+    const firstRead = new Promise<void>(r => (release = r))
+    let firstReadStarted!: () => void
+    const started = new Promise<void>(r => (firstReadStarted = r))
+    let first = true
+    const getItem = vi.fn(async (k: string) => {
+      if (first) {
+        first = false
+        firstReadStarted()
+        await firstRead
+      }
+      return k in pod ? pod[k] : null
+    })
+    return {
+      storage: { getItem, setItem: vi.fn(async () => {}) },
+      release,
+      started, // resolves once the first getItem has begun (so we race AT the suspension point)
+      getItem,
+    }
+  }
+
+  it('a generation bump (login/logout) DURING the hydrate → NO mirrored-key localStorage write, singleton NOT installed, podConnected() false', async () => {
+    // Seed the pod with the OLD (restored) user's mirrored data — a non-gated hydrate would mirror these.
+    const { storage, release, started } = suspendableStorage({
+      'elk-settings': { fontSize: '99px' },
+      'elk-drafts': { home: ['stale'] },
+      'elk-custom-emojis': { stale: true },
+    })
+    const restoreGen = beginRestoreGeneration()
+    const isCurrent = () => isRestoreGenerationCurrent(restoreGen)
+
+    const mounting = setPodStorage(storage as never, isCurrent)
+    // Wait until the hydrate is suspended at its FIRST pod read, then race a login()/logout().
+    await started
+    bumpRestoreGeneration() // what login() / disconnectSolid() does first → the restore is now STALE
+    release() // resume the suspended getItem; the post-await guard must now abort the hydrate
+    await mounting
+
+    // NO mirrored key was written to localStorage for the stale restore.
+    expect(env.store.has('elk-settings')).toBe(false)
+    expect(env.store.has('elk-drafts')).toBe(false)
+    expect(env.store.has('elk-custom-emojis')).toBe(false)
+    // The pod-storage singleton was NOT installed (setPodStorage refused on the stale restore).
+    expect(podConnected()).toBe(false)
+    // And the watcher would not be started either (the plugin re-checks isCurrent before watch).
+    expect(isCurrent()).toBe(false)
+  })
+
+  it('happy path (no race): the hydrate fully mirrors the pod keys AND installs the singleton (guards NOT vacuous)', async () => {
+    const { storage, release, started } = suspendableStorage({
+      'elk-settings': { fontSize: '15px' },
+      'elk-drafts': { home: ['draft1'] },
+      'elk-custom-emojis': { a: 1 },
+    })
+    const restoreGen = beginRestoreGeneration()
+    const isCurrent = () => isRestoreGenerationCurrent(restoreGen)
+
+    const mounting = setPodStorage(storage as never, isCurrent)
+    await started
+    // NO race — nothing bumps the generation. Release and let the hydrate complete.
+    release()
+    await mounting
+
+    // Every mirrored key was hydrated into localStorage (writeLocal stores JSON).
+    expect(JSON.parse(env.store.get('elk-settings')!)).toEqual({ fontSize: '15px' })
+    expect(JSON.parse(env.store.get('elk-drafts')!)).toEqual({ home: ['draft1'] })
+    expect(JSON.parse(env.store.get('elk-custom-emojis')!)).toEqual({ a: 1 })
+    // The singleton IS installed → podConnected() true (proving the install-gate is not always-skip).
+    expect(podConnected()).toBe(true)
+    expect(isCurrent()).toBe(true)
+  })
+
+  it('the FIRST awaited pod read is itself gated: a bump BEFORE release means getItem is not even re-read past the suspended one', async () => {
+    // Proves the BEFORE-the-write guard AND the BEFORE-the-read guard both fire: after the stale
+    // bump, the hydrate aborts at the post-read guard for key #1 and never reads keys #2/#3.
+    const { storage, release, started, getItem } = suspendableStorage({
+      'elk-settings': { x: 1 },
+      'elk-drafts': { y: 2 },
+      'elk-custom-emojis': { z: 3 },
+    })
+    const restoreGen = beginRestoreGeneration()
+    const isCurrent = () => isRestoreGenerationCurrent(restoreGen)
+
+    const mounting = setPodStorage(storage as never, isCurrent)
+    await started
+    bumpRestoreGeneration()
+    release()
+    await mounting
+
+    // Only the FIRST (already-suspended) read ran; the loop aborted before reading keys #2 and #3
+    // (the pre-read guard short-circuits the next iterations).
+    expect(getItem).toHaveBeenCalledTimes(1)
+    expect(podConnected()).toBe(false)
+  })
+
+  it('non-vacuity: with the guard passed but the WHOLE hydrate current, all THREE keys are read (no premature abort)', async () => {
+    // Confirms the gated path reads every key when current — so the abort in the race tests is
+    // genuinely caused by the bump, not by the guard short-circuiting unconditionally.
+    const { storage, release, started, getItem } = suspendableStorage({
+      'elk-settings': { x: 1 },
+      'elk-drafts': { y: 2 },
+      'elk-custom-emojis': { z: 3 },
+    })
+    const restoreGen = beginRestoreGeneration()
+    const isCurrent = () => isRestoreGenerationCurrent(restoreGen)
+    const mounting = setPodStorage(storage as never, isCurrent)
+    await started
+    release()
+    await mounting
+    expect(getItem).toHaveBeenCalledTimes(3)
   })
 })
 

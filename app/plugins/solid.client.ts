@@ -147,11 +147,15 @@ export default defineNuxtPlugin(async () => {
     if (isCurrent && !isCurrent())
       return
     const storage = createPodStorage(kvContainer, solidFetch.value)
-    await setPodStorage(storage)
+    // Thread the guard INTO setPodStorage so EVERY post-await shared/persistent write it performs —
+    // each mirrored-key `localStorage` write inside the hydrate loop AND the pod-storage singleton
+    // install — is itself generation-gated. A stale restore mirrors NO data and installs NO singleton
+    // (setPodStorage refuses both the moment the generation changes).
+    await setPodStorage(storage, isCurrent)
     // `setPodStorage` awaits a hydrate; re-check ONE more time before starting the mirror watcher so
     // a login()/logout() that raced during the hydrate does not leave a watcher running for a stale
-    // (old/logged-out) session. `podConnected()` additionally gates on solidWebId/solidPodBase (which
-    // a logout clears), so a briefly-installed storage singleton is inert; we simply do not watch.
+    // (old/logged-out) session. setPodStorage already refused to install the singleton on a stale
+    // restore (so there is nothing installed to tear down here); we simply do not start the watcher.
     if (isCurrent && !isCurrent())
       return
     // Persist ongoing settings/drafts/emoji edits to the pod (not just the initial hydrate).

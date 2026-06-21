@@ -90,12 +90,31 @@ export function writeLocal(key: MirroredKey, value: unknown): void {
  * Pull each mirrored key from the pod into localStorage (the connect-time hydrate). Used
  * when a pod copy should win on a fresh device. Missing pod keys are left untouched (the
  * local default / existing value stands). Returns the set of keys actually hydrated.
+ *
+ * SILENT-RESTORE RACE (roborev HIGH — the DEEPEST race window): each `writeLocal` is a
+ * persistent `localStorage` write that lands the RESTORED user's mirrored data into local
+ * state, and it runs AFTER an `await storage.getItem(...)`. A login()/logout() racing the
+ * in-flight silent restore can fire during ANY of those awaits, so a now-stale restore must
+ * NOT mirror the OLD user's `elk-settings`/`elk-drafts`/`elk-custom-emojis` over the newer
+ * session's local state. The OPTIONAL `isCurrent` guard (the captured restore generation) is
+ * therefore checked BEFORE EACH awaited pod read AND BEFORE EACH `localStorage` write; the
+ * MOMENT it goes stale the hydrate ABORTS — it writes nothing further and returns the keys
+ * hydrated so far (the caller — `setPodStorage` — then refuses to install/keep the singleton
+ * and never starts the watcher). The interactive login()/manual hydrate path passes no guard
+ * (it is itself the latest action), so its behaviour is unchanged.
  */
-export async function hydrateFromPod(storage: Storage): Promise<MirroredKey[]> {
+export async function hydrateFromPod(storage: Storage, isCurrent?: () => boolean): Promise<MirroredKey[]> {
   const hydrated: MirroredKey[] = []
   for (const key of MIRRORED_KEYS) {
+    // BEFORE the awaited pod read: a stale restore must not even read the OLD user's pod.
+    if (isCurrent && !isCurrent())
+      return hydrated
     try {
       const value = await storage.getItem(podKey(key))
+      // BEFORE the localStorage write: a login()/logout() may have raced during getItem().
+      // If so, abort immediately — never mirror the stale restored user's data into local state.
+      if (isCurrent && !isCurrent())
+        return hydrated
       if (value != null) {
         writeLocal(key, value)
         hydrated.push(key)
