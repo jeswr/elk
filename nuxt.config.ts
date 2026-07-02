@@ -15,6 +15,19 @@ const mockProxy = resolveModulePath('mocked-exports/proxy', {
   from: import.meta.url,
 })
 
+// @jeswr/solid-task-model's ROOT barrel re-exports its Node-only shape helpers
+// (node:fs / node:url), which hard-fails the browser/PWA bundle when
+// @jeswr/solid-chat-interop (used by app/solid/mirror.ts) re-exports vocab
+// constants from that root. The only task-model names that ever reach client
+// code are pure constants from its vocab module (TASK_CLASS, WF_OPEN,
+// WF_CLOSED, wf), so alias the root import to the browser-safe vocab.js.
+// (Resolved via chat-interop because task-model is its transitive dep under
+// pnpm's strict node_modules layout.) Remove once solid-task-model's root
+// barrel is browser-safe upstream.
+const solidTaskModelVocab = resolveModulePath('@jeswr/solid-task-model', {
+  from: resolveModulePath('@jeswr/solid-chat-interop', { from: import.meta.url }),
+}).replace(/index\.js$/, 'vocab.js')
+
 export default defineNuxtConfig({
   compatibilityDate: '2025-07-11',
   typescript: {
@@ -78,6 +91,7 @@ export default defineNuxtConfig({
   alias: {
     'change-case': 'scule',
     'semver': resolve('./mocks/semver'),
+    '@jeswr/solid-task-model': solidTaskModelVocab,
   },
   imports: {
     dirs: [

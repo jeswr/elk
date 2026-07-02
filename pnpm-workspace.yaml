@@ -81,12 +81,53 @@ trustPolicyExclude:
 packages:
   - docs
 
+# The range-selector entries below are the Solid fork's SECURITY overrides:
+# they force the first-patched versions of the transitive deps flagged by open
+# Dependabot alerts. Range-selector form only replaces the VULNERABLE
+# instances — it never downgrades an already-safe copy and never
+# cross-major-breaks another consumer (minimatch/picomatch/path-to-regexp/
+# brace-expansion all have multiple majors in the tree). Covers the 1 critical
+# + 29 high + all medium/low runtime alerts EXCEPT rollup@2.79.2
+# (GHSA-mw96-cpmx-2vgc): its advertised patch 2.80.0 was never published
+# (2.x ends at 2.79.2) and workbox-build's @rollup/plugin-babel@5
+# hard-requires rollup 2 — build-time-only residual, needs an upstream
+# workbox/vite-pwa bump.
 overrides:
+  '@babel/core@<=7.29.0': 7.29.6
+  '@babel/plugin-transform-modules-systemjs@>=7.12.0 <=7.29.3': 7.29.4
+  '@hono/node-server@<1.19.13': 1.19.13
+  '@modelcontextprotocol/sdk@>=1.10.0 <=1.25.3': 1.26.0
+  brace-expansion@<1.1.13: 1.1.13
+  brace-expansion@>=5.0.0 <5.0.6: 5.0.6
+  defu@<=6.1.4: 6.1.5
+  devalue@>=5.6.3 <=5.8.0: 5.8.1
+  esbuild@>=0.27.3 <0.28.1: 0.28.1
+  fast-uri@<=3.1.1: 3.1.2
+  flatted@<=3.4.1: 3.4.2
+  h3@<1.15.9: 1.15.9
+  hono@<4.12.25: 4.12.25
+  js-cookie@<=3.0.5: 3.0.7
+  js-yaml@>=4.0.0 <=4.1.1: 4.2.0
+  launch-editor@<=2.14.0: 2.14.1
+  linkify-it@<=5.0.0: 5.0.1
+  lodash@<=4.17.23: 4.18.0
+  markdown-it@<=14.1.1: 14.2.0
+  minimatch@>=9.0.0 <9.0.7: 9.0.7
   nuxt-component-meta: 0.17.2
+  nuxt-og-image@<6.2.5: 6.2.5
+  path-to-regexp@>=8.0.0 <8.4.0: 8.4.0
+  picomatch@>=4.0.0 <4.0.4: 4.0.4
+  qs@>=6.11.1 <=6.15.1: 6.15.2
   serialize-javascript: 7.0.5
+  shell-quote@>=1.1.0 <=1.8.3: 1.8.4
+  socket.io-parser@>=4.0.0 <4.2.6: 4.2.6
+  undici@>=7.0.0 <7.28.0: 7.28.0
   unstorage: ^1.17.5
-  vitest: 4.1.8
+  vitest: 4.1.9
   vue: ^3.5.4
+  webpack@>=5.49.0 <=5.104.0: 5.104.1
+  ws@>=8.0.0 <8.21.0: 8.21.0
+  yaml@>=2.0.0 <2.8.3: 2.8.3
 
 verifyDepsBeforeRun: install
 
@@ -95,6 +136,15 @@ verifyDepsBeforeRun: install
 blockExoticSubdeps: false
 
 allowBuilds:
+  '@jeswr/federation-registry@https://codeload.github.com/jeswr/federation-registry/tar.gz/aacb6bb6168239ef41a0949bfe454f9b16e1716f': true
+  '@jeswr/solid-chat-interop@https://codeload.github.com/jeswr/solid-chat-interop/tar.gz/ceb8784c5340027dceb1f926b944e3222055b50a': true
+  '@jeswr/solid-session-restore@https://codeload.github.com/jeswr/solid-session-restore/tar.gz/32bf38c0bf83b23624cabf4ab55f912ab7174051': true
+  '@jeswr/solid-task-model@https://codeload.github.com/jeswr/solid-task-model/tar.gz/fa88a345a5ed03b26b46efd57d448ebd9ca8a826': true
+  # The @jeswr suite git-deps are the maintainer's own repos; pnpm 11 requires a
+  # git-hosted package with a build script to be explicitly allowlisted (by its
+  # exact resolved tarball URL) before it will prepare it. Update the SHA when a
+  # #main re-resolve moves the pin.
+  '@jeswr/unstorage-solid@https://codeload.github.com/jeswr/unstorage-solid/tar.gz/d79c890f95c879beb7d75c4dadada53af5190c9a': true
   '@parcel/watcher': false
   '@tailwindcss/oxide': false
   better-sqlite3: true
