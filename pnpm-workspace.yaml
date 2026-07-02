@@ -96,6 +96,12 @@ overrides:
   '@babel/core@<=7.29.0': 7.29.6
   '@babel/plugin-transform-modules-systemjs@>=7.12.0 <=7.29.3': 7.29.4
   '@hono/node-server@<1.19.13': 1.19.13
+  # @jeswr/solid-task-model is a transitive dep of @jeswr/solid-chat-interop
+  # (whose own package.json pins an older task-model sha). Force it to the
+  # browser-safe 0.4.0 root-barrel release so the nuxt.config.ts alias
+  # workaround for the node:fs/node:url leak can be dropped. Update the sha
+  # when re-pinning.
+  '@jeswr/solid-task-model': github:jeswr/solid-task-model#0a872d7771ca66d1776170fcd7b5fbd195f4ff9e
   '@modelcontextprotocol/sdk@>=1.10.0 <=1.25.3': 1.26.0
   brace-expansion@<1.1.13: 1.1.13
   brace-expansion@>=5.0.0 <5.0.6: 5.0.6
@@ -139,7 +145,7 @@ allowBuilds:
   '@jeswr/federation-registry@https://codeload.github.com/jeswr/federation-registry/tar.gz/aacb6bb6168239ef41a0949bfe454f9b16e1716f': true
   '@jeswr/solid-chat-interop@https://codeload.github.com/jeswr/solid-chat-interop/tar.gz/ceb8784c5340027dceb1f926b944e3222055b50a': true
   '@jeswr/solid-session-restore@https://codeload.github.com/jeswr/solid-session-restore/tar.gz/32bf38c0bf83b23624cabf4ab55f912ab7174051': true
-  '@jeswr/solid-task-model@https://codeload.github.com/jeswr/solid-task-model/tar.gz/fa88a345a5ed03b26b46efd57d448ebd9ca8a826': true
+  '@jeswr/solid-task-model@https://codeload.github.com/jeswr/solid-task-model/tar.gz/0a872d7771ca66d1776170fcd7b5fbd195f4ff9e': true
   # The @jeswr suite git-deps are the maintainer's own repos; pnpm 11 requires a
   # git-hosted package with a build script to be explicitly allowlisted (by its
   # exact resolved tarball URL) before it will prepare it. Update the SHA when a
