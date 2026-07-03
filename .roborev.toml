@@ -1,2 +1,8 @@
-reviewer = "codex"
+# roborev config — agent must be explicit (repo-level 'reviewer' key is not
+# read by roborev; the global default_agent is misconfigured to an
+# unsupported agent, so an unset/ignored key here silently falls through to
+# it and every review errors). codex + low-severity matches the suite
+# convention (prod-solid-server, the other @jeswr fork repos).
+agent = "codex"
+model = "gpt-5.5"
 review_min_severity = "low"

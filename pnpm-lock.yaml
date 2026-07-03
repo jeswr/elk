@@ -362,7 +362,7 @@ importers:
         specifier: ^7.4.0
         version: 7.4.0
       ws:
-        specifier: 8.21.0
+        specifier: ^8.21.0
         version: 8.21.0
     devDependencies:
       '@antfu/eslint-config':
