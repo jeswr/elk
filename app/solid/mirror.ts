@@ -128,6 +128,40 @@ export function statusSlug(status: MirrorableStatus): string {
   return `status-${h.toString(16).padStart(8, '0')}.ttl`
 }
 
+/**
+ * Validate + normalise a pod-base URL into a canonical container address: an absolute
+ * http(s) URL with exactly one trailing `/`, no query, no fragment.
+ *
+ * SECURITY (untrusted-RDF hardening): `podBase` is derived (via `resolveStorageRoot` +
+ * the `ELK_POD_NAMESPACE` suffix) from the user's WebID profile — attacker-influenced
+ * input, not trusted config. The naive `podBase.endsWith('/') ? podBase : podBase + '/'`
+ * this replaces trusts the RAW string: a value like `https://evil.example/foo?x=/` (or
+ * `#/`) already "ends with /" via its query/fragment while its actual path does not, so
+ * the old check silently accepted it and the caller then concatenated
+ * `TIMELINE_CONTAINER` onto a completely different resource than intended. Parsing via
+ * `new URL()` and rejecting any `search`/`hash` closes that: the trailing slash can only
+ * come from the real pathname.
+ *
+ * @throws Error if `podBase` is not a parseable absolute http(s) URL, or carries a
+ * query/fragment.
+ */
+function normalizePodBase(podBase: string): string {
+  let url: URL
+  try {
+    url = new URL(podBase)
+  }
+  catch {
+    throw new TypeError(`mirrorStatus: podBase is not a valid absolute URL: ${podBase}`)
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:')
+    throw new TypeError(`mirrorStatus: podBase must be http(s), got: ${podBase}`)
+  if (url.search !== '' || url.hash !== '')
+    throw new TypeError(`mirrorStatus: podBase must not carry a query/fragment: ${podBase}`)
+  if (!url.pathname.endsWith('/'))
+    url.pathname = `${url.pathname}/`
+  return url.toString()
+}
+
 /** Join a container (ending `/`) and a slug into a child resource URL that cannot escape it. */
 export function timelineResourceUrl(container: string, slug: string): string {
   const base = container.endsWith('/') ? container : `${container}/`
@@ -176,8 +210,12 @@ export async function mirrorStatus(
   options: MirrorStatusOptions,
 ): Promise<MirrorResult> {
   const { fetch: fetchImpl, webId, podBase, ensureAcl = true } = options
-  const base = podBase.endsWith('/') ? podBase : `${podBase}/`
-  const container = `${base}${TIMELINE_CONTAINER}`
+  const base = normalizePodBase(podBase)
+  // Resolve the sub-container via `new URL(child, base)`, never string concatenation — a
+  // `podBase` that carries a query/fragment forged its trailing "/" (see
+  // `normalizePodBase`'s reject rule); resolving through URL rather than concatenation means
+  // a malformed base can no longer smuggle the mirror write onto an unintended resource.
+  const container = new URL(TIMELINE_CONTAINER, base).toString()
 
   if (ensureAcl) {
     // Fail-closed: if the ACL cannot be written, do NOT write the message.

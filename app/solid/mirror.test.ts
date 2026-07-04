@@ -146,4 +146,68 @@ describe('mirrorStatus', () => {
     expect(body).toContain('https://www.w3.org/ns/activitystreams#')
     expect(body).toContain('Hello fediverse')
   })
+
+  // ---- podBase raw-string-URL-smuggling hardening ----
+  //
+  // `podBase` is derived (via `resolveStorageRoot` + `ELK_POD_NAMESPACE`) from the user's
+  // WebID profile RDF — untrusted input. The old `podBase.endsWith('/') ? podBase :
+  // podBase + '/'` check trusted the RAW string, so a value whose query/fragment supplied
+  // the trailing "/" (e.g. `https://evil.example/foo?x=/`) passed while its actual path was
+  // `/foo` — the timeline container then resolved onto a different resource than intended.
+  describe('podBase hardening (normalizePodBase)', () => {
+    it('rejects a podBase whose trailing "/" comes from a QUERY string', async () => {
+      const fetchImpl = vi.fn(async () => new Response(null, { status: 201 }))
+      await expect(mirrorStatus(STATUS, {
+        fetch: fetchImpl as unknown as typeof fetch,
+        webId: WEBID,
+        podBase: 'https://alice.pod.example/foo?x=/',
+      })).rejects.toThrow(/query\/fragment/)
+      expect(fetchImpl).not.toHaveBeenCalled()
+    })
+
+    it('rejects a podBase whose trailing "/" comes from a FRAGMENT', async () => {
+      const fetchImpl = vi.fn(async () => new Response(null, { status: 201 }))
+      await expect(mirrorStatus(STATUS, {
+        fetch: fetchImpl as unknown as typeof fetch,
+        webId: WEBID,
+        podBase: 'https://alice.pod.example/foo#/',
+      })).rejects.toThrow(/query\/fragment/)
+      expect(fetchImpl).not.toHaveBeenCalled()
+    })
+
+    it('rejects an unparseable podBase', async () => {
+      const fetchImpl = vi.fn(async () => new Response(null, { status: 201 }))
+      await expect(mirrorStatus(STATUS, {
+        fetch: fetchImpl as unknown as typeof fetch,
+        webId: WEBID,
+        podBase: 'not a url at all',
+      })).rejects.toThrow(/valid absolute URL/)
+      expect(fetchImpl).not.toHaveBeenCalled()
+    })
+
+    it('rejects a non-http(s) podBase', async () => {
+      const fetchImpl = vi.fn(async () => new Response(null, { status: 201 }))
+      await expect(mirrorStatus(STATUS, {
+        fetch: fetchImpl as unknown as typeof fetch,
+        webId: WEBID,
+        podBase: 'file:///etc/',
+      })).rejects.toThrow(/http\(s\)/)
+      expect(fetchImpl).not.toHaveBeenCalled()
+    })
+
+    it('a real, well-shaped podBase resolves the timeline container correctly via new URL(child, base)', async () => {
+      const calls: string[] = []
+      const fetchImpl = vi.fn(async (url: string) => {
+        calls.push(url)
+        return new Response(null, { status: 201 })
+      })
+      await mirrorStatus(STATUS, {
+        fetch: fetchImpl as unknown as typeof fetch,
+        webId: WEBID,
+        podBase: 'https://alice.pod.example/elk',
+      })
+      expect(calls[0]).toBe('https://alice.pod.example/elk/timeline/.acl')
+      expect(calls[1].startsWith('https://alice.pod.example/elk/timeline/status-')).toBe(true)
+    })
+  })
 })
