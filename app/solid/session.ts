@@ -168,9 +168,45 @@ export const ELK_SESSION_DB_NAME = 'elk-solid:sessions'
 export const ELK_POD_NAMESPACE = 'elk/'
 
 /**
+ * Validate + normalise an untrusted container-URL string (a `pim:storage` object value)
+ * into a canonical container address, or `undefined` when it must be rejected.
+ *
+ * SECURITY (untrusted-RDF hardening): a WebID profile is fetched from wherever the
+ * user's `pim:storage` triple points — it is attacker-influenced input, not trusted
+ * config. The naive `root.endsWith('/')` check this replaces operates on the RAW
+ * string, so a value like `https://evil.example/foo?x=/` or `https://evil.example/foo#/`
+ * satisfies it (the string literally ends with `/`) while the ACTUAL resource path is
+ * `/foo` — the query/fragment is what supplied the trailing slash. Concatenating a
+ * sub-path onto that raw string then lands on a completely different resource than the
+ * container-shape check implied. Parsing via `new URL()` FIRST and checking the PARSED
+ * `pathname` closes this: a query/fragment can no longer forge the container shape.
+ *
+ * Rejects: an unparseable value, a non-http(s) scheme, any `search`/`hash` component
+ * (a container address carries neither), and a pathname that does not end with `/`.
+ * Returns the canonical `url.toString()` on success.
+ */
+function normalizeContainerUrl(value: string): string | undefined {
+  let url: URL
+  try {
+    url = new URL(value)
+  }
+  catch {
+    return undefined
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:')
+    return undefined
+  if (url.search !== '' || url.hash !== '')
+    return undefined
+  if (!url.pathname.endsWith('/'))
+    return undefined
+  return url.toString()
+}
+
+/**
  * Resolve the pod storage root for a WebID by dereferencing its profile and reading
  * `pim:storage` (`http://www.w3.org/ns/pim/space#storage`). Falls back to the WebID's
- * origin root when the profile advertises no storage. Returns a URL ending in `/`.
+ * origin root when the profile advertises no (validatable) storage. Returns a URL
+ * ending in exactly one `/`, with no query/fragment (see {@link normalizeContainerUrl}).
  *
  * Uses the injected (authed) fetch so a private profile still resolves.
  */
@@ -190,8 +226,12 @@ export async function resolveStorageRoot(
       const dataset = await parseRdf(body, ct, { baseIRI: webId })
       for (const quad of dataset) {
         if (quad.predicate.value === PIM_STORAGE && quad.object.termType === 'NamedNode') {
-          const root = quad.object.value
-          return root.endsWith('/') ? root : `${root}/`
+          const normalized = normalizeContainerUrl(quad.object.value)
+          if (normalized)
+            return normalized
+          // Malformed/malicious pim:storage value (query/fragment/non-container-shape,
+          // or an unparseable/non-http(s) IRI) — skip it and keep looking at the rest of
+          // the profile; fall through to the origin-root default if none validates.
         }
       }
     }
@@ -563,7 +603,11 @@ export async function connectSolid(webId: string, isCurrent?: () => boolean): Pr
   if (isCurrent && !isCurrent())
     return
   solidWebId.value = webId
-  solidPodBase.value = `${root}${ELK_POD_NAMESPACE}`
+  // Build the sub-path via `new URL(child, base)`, never raw string concatenation — `root`
+  // is already normalised (normalizeContainerUrl), but resolving through URL rather than
+  // template-literal concat means a future change to root's shape can't silently reintroduce
+  // the query/fragment-smuggling class this module was hardened against.
+  solidPodBase.value = new URL(ELK_POD_NAMESPACE, root).toString()
   try {
     globalThis.localStorage?.setItem(SOLID_WEBID_KEY, webId)
   }

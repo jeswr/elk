@@ -65,6 +65,8 @@ const {
   solidWebId,
   solidPodBase,
   ELK_REMEMBERED_ACCOUNT_KEY,
+  ELK_POD_NAMESPACE,
+  resolveStorageRoot,
 } = await import('./session')
 const { createPodStorage } = await import('./storage')
 
@@ -945,5 +947,54 @@ describe('solidFetch reset — no cross-user DPoP-token reuse after logout / bef
     expect(protectedResourceRequestMock.mock.calls[1][0]).toBe('token2')
     // No popup at any point.
     expect(windowOpen).not.toHaveBeenCalled()
+  })
+})
+
+// ---- resolveStorageRoot — untrusted `pim:storage` hardening (raw-string-URL smuggling). ----
+//
+// Root cause this guards against: the OLD `root.endsWith('/')` check operated on the RAW
+// string read off the WebID profile RDF. A `pim:storage` value with a query/fragment that
+// itself ends in "/" (e.g. `https://evil.example/foo?x=/` or `.../foo#/`) satisfied that
+// check while the PARSED path is actually `/foo` — so a sub-path concatenated onto the
+// "root" landed on a different resource than the container-shape check implied. The fix
+// parses via `new URL()` and validates the PARSED pathname/search/hash instead.
+describe('resolveStorageRoot — untrusted pim:storage hardening (raw-string-URL smuggling)', () => {
+  const WEBID = 'https://alice.pod.example/profile/card#me'
+
+  function fetchWithStorageTriple(storageValue: string): typeof globalThis.fetch {
+    const turtle = `<${WEBID}> <http://www.w3.org/ns/pim/space#storage> <${storageValue}> .`
+    return (async () =>
+      new Response(turtle, { status: 200, headers: { 'content-type': 'text/turtle' } })) as typeof globalThis.fetch
+  }
+
+  it('rejects a pim:storage value whose trailing "/" comes from a QUERY string, falling back to the origin root', async () => {
+    const root = await resolveStorageRoot(WEBID, fetchWithStorageTriple('https://evil.example/foo?x=/'))
+    expect(root).toBe('https://alice.pod.example/')
+  })
+
+  it('rejects a pim:storage value whose trailing "/" comes from a FRAGMENT, falling back to the origin root', async () => {
+    const root = await resolveStorageRoot(WEBID, fetchWithStorageTriple('https://evil.example/foo#/'))
+    expect(root).toBe('https://alice.pod.example/')
+  })
+
+  it('rejects a pim:storage value whose PARSED pathname does not end in "/" (not a container)', async () => {
+    const root = await resolveStorageRoot(WEBID, fetchWithStorageTriple('https://alice.pod.example/not-a-container'))
+    expect(root).toBe('https://alice.pod.example/')
+  })
+
+  it('rejects a non-http(s) pim:storage value', async () => {
+    const root = await resolveStorageRoot(WEBID, fetchWithStorageTriple('file:///etc/passwd/'))
+    expect(root).toBe('https://alice.pod.example/')
+  })
+
+  it('accepts a genuine, well-shaped pim:storage container and returns it verbatim', async () => {
+    const root = await resolveStorageRoot(WEBID, fetchWithStorageTriple('https://alice.pod.example/storage/'))
+    expect(root).toBe('https://alice.pod.example/storage/')
+  })
+
+  it('sub-path resolution off a validated root is correct (new URL(child, base), not concat)', async () => {
+    const root = await resolveStorageRoot(WEBID, fetchWithStorageTriple('https://alice.pod.example/storage/'))
+    const podBase = new URL(ELK_POD_NAMESPACE, root).toString()
+    expect(podBase).toBe('https://alice.pod.example/storage/elk/')
   })
 })

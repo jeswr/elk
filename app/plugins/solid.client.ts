@@ -135,7 +135,11 @@ export default defineNuxtPlugin(async () => {
     const base = solidPodBase.value
     if (!base)
       return
-    const kvContainer = `${base}kv/`
+    // Resolve via `new URL(child, base)`, never string concatenation (see the
+    // `normalizeContainerUrl`/`normalizePodBase` hardening in ./session.ts + ./mirror.ts —
+    // `base` is already normalised, but resolving through URL is defence-in-depth against
+    // a future change reintroducing a raw-string-concat sub-path).
+    const kvContainer = new URL('kv/', base).toString()
     // Owner-only ACL FIRST — throws on failure (fail-closed; never mount on an unprotected container).
     await ensureKvAcl(kvContainer)
     // SILENT-RESTORE RACE (roborev HIGH): `ensureKvAcl` awaits, so a login()/logout() can race ahead
