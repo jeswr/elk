@@ -82,6 +82,28 @@ refresh-grant seam and never opens an interactive popup). **Elk's full upstream 
 Nuxt-bound test suite were NOT re-run** as part of this change — they are large and out of
 scope for the integration; the gate is scoped to the added modules plus the full-tree typecheck.
 
+## Deploying to Vercel (the prebuilt path — REQUIRED)
+
+A remote Vercel build (`vercel deploy` without `--prebuilt`) ships a BROKEN app: Elk's
+build runs the vite client build twice (prerender pass, then the final PWA pass) with a
+diverging chunk-hash subtree, and the final `.vercel/output/static/_nuxt` snapshot keeps
+only the second pass — so the prerendered HTML's entry + ~20 chunks 404 in production
+(observed live 2026-07-06, ~100 missing chunks). Until that upstream quirk is fixed,
+deploy PREBUILT from a local build:
+
+```sh
+NUXT_PUBLIC_ELK_ORIGIN=https://elk-solid.vercel.app NUXT_STORAGE_DRIVER=memory \
+  NITRO_PRESET=vercel pnpm build
+# verify every /_nuxt chunk referenced by .vercel/output/static/**/*.html exists;
+# copy any missing (content-hash-named, so byte-identical) from a plain-build's
+# .output/public/_nuxt/ into .vercel/output/static/_nuxt/
+npx vercel deploy --prebuilt --prod --yes
+```
+
+Production project `elk-solid` env: `NUXT_PUBLIC_ELK_ORIGIN` (pins the served
+`client_id` origin), `NUXT_STORAGE_DRIVER=memory` (serverless FS is read-only; durable
+Mastodon app-registration storage — Vercel KV / Cloudflare KV — is a follow-up).
+
 ## Follow-ups
 
 - **Offline-first** via `@jeswr/solid-offline` (service-worker pod cache + change
