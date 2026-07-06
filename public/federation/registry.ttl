@@ -5,10 +5,10 @@
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#>.
 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>.
 
-<https://elk.jeswr.org/federation/registry> a fedreg:Registry;
-    fedreg:member <https://elk.jeswr.org/federation/registry#elk>.
-<https://elk.jeswr.org/federation/registry#elk> a fedreg:Membership;
-    fedreg:app <https://elk.jeswr.org/clientid.jsonld>;
+<https://elk-solid.vercel.app/federation/registry> a fedreg:Registry;
+    fedreg:member <https://elk-solid.vercel.app/federation/registry#elk>.
+<https://elk-solid.vercel.app/federation/registry#elk> a fedreg:Membership;
+    fedreg:app <https://elk-solid.vercel.app/clientid.jsonld>;
     fedreg:status fedreg:Active;
-    fedreg:assertedBy <https://jeswr.org/profile/card#me>;
-    fedreg:asserted "2026-06-21T00:00:00.000Z"^^xsd:dateTime.
+    fedreg:assertedBy <https://jeswr.org/#me>;
+    fedreg:asserted "2026-07-06T00:00:00.000Z"^^xsd:dateTime.

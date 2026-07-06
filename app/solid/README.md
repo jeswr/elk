@@ -48,16 +48,18 @@ in `app/composables/masto/publish.ts` after a successful post.
 
 ## Federation IRIs registered
 
-The canonical prod origin is `https://elk.jeswr.org` (the served doc is origin-aware — at any
-other deploy origin every origin-bearing IRI below is rebased to that origin):
+The LIVE production origin is `https://elk-solid.vercel.app` (deployed 2026-07-06,
+`NUXT_PUBLIC_ELK_ORIGIN` pinned; the served doc is origin-aware — at any other deploy
+origin every origin-bearing IRI below is rebased to that origin). `elk.jeswr.org` is the
+eventual custom domain — regenerate the membership when it lands:
 
-- **App (client_id):** `https://elk.jeswr.org/clientid.jsonld` — `fedapp:App`
+- **App (client_id):** `https://elk-solid.vercel.app/clientid.jsonld` — `fedapp:App`
 - **Sector:** `https://w3id.org/jeswr/sectors/social#sector`
 - **Produces / consumes:** `https://w3id.org/jeswr/sectors/social/shapes#NoteShape`, `as:Note`
-- **Registry:** `https://elk.jeswr.org/federation/registry`
-- **Membership:** `https://elk.jeswr.org/federation/registry#elk` — `fedreg:status fedreg:Active`,
-  `fedreg:app` → the client_id. `assertedBy` is a **PLACEHOLDER** maintainer WebID
-  (`https://jeswr.org/profile/card#me`) — see follow-ups.
+- **Registry:** `https://elk-solid.vercel.app/federation/registry`
+- **Membership:** `https://elk-solid.vercel.app/federation/registry#elk` — `fedreg:status fedreg:Active`,
+  `fedreg:app` → the client_id, `fedreg:assertedBy` → the maintainer WebID
+  (`https://jeswr.org/#me`).
 
 ## Gate (scope)
 
@@ -84,8 +86,8 @@ scope for the integration; the gate is scoped to the added modules plus the full
 
 - **Offline-first** via `@jeswr/solid-offline` (service-worker pod cache + change
   invalidation) — documented follow-up, not in the MVP.
-- **`assertedBy` maintainer WebID** — the membership doc uses a placeholder; replace with the
-  real registry-operator WebID before the membership is authoritative.
+- ~~**`assertedBy` maintainer WebID**~~ — DONE (go-live 2026-07-06): the membership is asserted
+  by the maintainer WebID `https://jeswr.org/#me`.
 - **Bookmark mirror** — the post path is wired; bookmarking can call `mirrorOwnStatus`
   similarly from `app/composables/masto/status.ts` (the same controller seam).
 - **Login UI** — the plugin exposes `$solid.login(webId)` / `$solid.logout()` and uses a

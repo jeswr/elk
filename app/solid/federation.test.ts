@@ -10,7 +10,9 @@ import { listMembers } from '@jeswr/federation-registry'
 import { describe, expect, it } from 'vitest'
 import { buildClientIdDocument, serializeClientIdDocument } from './clientid-document'
 
-const CLIENT_ID = 'https://elk.jeswr.org/clientid.jsonld'
+// The LIVE production origin (Vercel). `elk.jeswr.org` is the eventual custom domain —
+// regenerate the membership + this constant when it lands.
+const CLIENT_ID = 'https://elk-solid.vercel.app/clientid.jsonld'
 const SOCIAL_SECTOR = 'https://w3id.org/jeswr/sectors/social#sector'
 const NOTE_SHAPE = 'https://w3id.org/jeswr/sectors/social/shapes#NoteShape'
 
@@ -22,7 +24,7 @@ function readPublic(rel: string): string {
 describe('clientid.jsonld fedapp self-registration (origin-aware template)', () => {
   // The doc is generated origin-aware by the `/clientid.jsonld` server route from this same
   // pure template; the canonical prod membership origin is exercised here.
-  const doc = buildClientIdDocument('https://elk.jeswr.org') as Record<string, any>
+  const doc = buildClientIdDocument('https://elk-solid.vercel.app') as Record<string, any>
 
   it('declares an fedapp:App in the social sector', () => {
     expect(doc['@type']).toBe('App')
@@ -45,7 +47,7 @@ describe('clientid.jsonld fedapp self-registration (origin-aware template)', () 
   })
 
   it('lists the OAuth callback in redirect_uris and webid scope (Solid login)', () => {
-    expect(doc.redirect_uris).toContain('https://elk.jeswr.org/callback.html')
+    expect(doc.redirect_uris).toContain('https://elk-solid.vercel.app/callback.html')
     expect(doc.scope.split(' ')).toContain('webid')
   })
 
@@ -77,7 +79,7 @@ describe('federation-registry membership', () => {
       headers: { 'content-type': 'text/turtle' },
     })) as unknown as typeof fetch
 
-    const members = await listMembers('https://elk.jeswr.org/federation/registry', {
+    const members = await listMembers('https://elk-solid.vercel.app/federation/registry', {
       fetch: fetchStub,
     })
     expect(members).toHaveLength(1)
