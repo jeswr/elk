@@ -1,0 +1,10 @@
+{
+  "$schema": "https://solid.example/suite-tracking/suite.schema.json",
+  "id": "elk",
+  "kind": "app",
+  "name": "Elk (Solid)",
+  "repo": "https://github.com/jeswr/elk",
+  "category": "social",
+  "maturity": "beta",
+  "visibility": "public"
+}
